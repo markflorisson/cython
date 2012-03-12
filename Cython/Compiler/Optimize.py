@@ -1667,6 +1667,99 @@ class InlineDefNodeCalls(Visitor.CythonTransform):
         return node
 
 
+class OptimizableExpression(Visitor.CythonTransform):
+    "Figure out whether a buffer index expression can be pulled out of a loop"
+
+    def __init__(self, node, assignments, target_index, replace_target=False):
+        """
+        target_index is the iteration index variable, and replace_target indicates whether
+        it should be replaced with another node. When the expression gets pulled out of the
+        loop you want to replace the target with the possible lower bound and possible
+        upper bound.
+        """
+        super(OptimizableExpression, self).__init__(None)
+
+        self.assignments = assignments
+        self.target_index = target_index
+        self.replace_target = replace_target
+        self.valid = True
+
+        self.visit_Node(node)
+
+    def visit_NameNode(self, node):
+        if node.entry == self.target_index.entry:
+            self.depends_on_target_index = True
+            if self.replace_target:
+                node = self.replace_target
+
+        if (not node.entry.is_local or node.entry.address_taken or
+                node.entry in self.assignments):
+            self.valid = False
+            return node
+
+        return node
+
+    def visit_ExprNode(self, node):
+        self.visitchildren(node)
+        return node
+
+class FindBoundsCheckCandidates(Visitor.CythonTransform):
+    "Find candidate index expressions for our boundscheck optimization"
+
+    def visit_ModuleNode(self, node):
+        self.candidates = []
+        return self.visit_Node(node)
+
+    def visit_IndexNode(self, node):
+        node = self.visit_Node(node)
+        if node.memslice_index and not node.memslice_slice:
+            self.candidates.append(node)
+        return node
+
+class OptimizeBoundsChecking(Visitor.CythonTransform):
+    """
+    Pull bound checks for buffers and wraparound code outside of loops.
+    If an error is detected outside of the loop, no exception may be raised
+    as the faulty index may be guarded, short circuited, etc, and any preceding
+    iterations and code must be executed. So instead we need an error path with
+    bounds checking enabled, and a normal path without.
+
+    Perform optimization iff
+        - variables used in the index expression are locals
+        - their address is not taken in the function
+        - the variables are not reassigned in the loop
+        - the index variable may be reassigned only after the indexing operation
+          (as it is overwritten every iteration)
+        - the expression does not have side effects (C type, no nested indexing)
+    """
+
+
+    def optimize_boundscheck(self, node):
+        candidates = FindBoundsCheckCandidates(node.body).candidates
+        optimized = []
+        for indexnode in candidates:
+            for index in indexnode.indices:
+                if (not index.has_sideeffects() and
+                        OptimizableExpression(index, assignments, node.target).valid):
+                    boundscheck = BoundsChecknode(index.pos, index=index, env=env)
+                    optimized.append(boundscheck)
+                    index.boundscheck_optimized = True
+
+        return optimized
+
+    def visit_ForInStatNode(self, node):
+        if not self.env.directives['boundscheck']:
+            return node
+
+        self.visitchildren(node)
+        optimized = self.optimize_boundscheck(node.body)
+        if optimized:
+            optimized.append(node)
+            return StatListNode(node.pos, stats=optimized)
+
+        return node
+
+
 class OptimizeBuiltinCalls(Visitor.EnvTransform):
     """Optimize some common methods calls and instantiation patterns
     for builtin types *after* the type analysis phase.

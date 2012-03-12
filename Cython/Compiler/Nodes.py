@@ -5825,6 +5825,7 @@ class ForInStatNode(LoopNode, StatNode):
     #  iterator      IteratorNode
     #  body          StatNode
     #  else_clause   StatNode
+    #  assignments   {Entry: cf.NameAssignment} used for bounds check opt
     #  item          NextNode       used internally
 
     child_attrs = ["target", "iterator", "body", "else_clause"]

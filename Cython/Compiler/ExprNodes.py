@@ -746,6 +746,27 @@ class ExprNode(Node):
         #  reference, or temporary.
         return self.result_in_temp()
 
+    def has_sideeffects(self):
+        """
+        Determines whether this expression may have side effects in the
+        context of code reordering only, such as the wraparound and boundscheck
+        optimization. This may return True even if there is no side effect in
+        the expression itself, but if the result of the expression may change
+        between the reordered site and the original site.
+
+        e.g. '2 * i - 16' will not return a side effect, but the caller must check
+        for any modifications of 'i'.
+
+        In the case of parallel.threadid(), the expression has no side effects
+        within the parallel context but may not be reordered outside of the
+        parallel section.
+
+        Call only after the types have been analyzed.
+        """
+        # operations for objects may do anything, assume side effects
+        return [x for x in self.subexpr_nodes()
+                      if x.has_sideeffects() or x.type.is_pyobject]
+
     def may_be_none(self):
         if self.type and not self.type.is_pyobject:
             return False
@@ -1332,6 +1353,9 @@ class NewExprNode(AtomicExprNode):
 
     def may_be_none(self):
         return False
+
+    def has_sideeffects(self):
+        return True
 
     def generate_result_code(self, code):
         pass
@@ -2351,6 +2375,9 @@ class IndexNode(ExprNode):
     # set by SingleAssignmentNode after analyse_types()
     is_memslice_scalar_assignment = False
 
+    # whether to perform boundscheck and wraparound optimizations
+    perform_boundscheck_opt = False
+
     def __init__(self, pos, index, *args, **kw):
         ExprNode.__init__(self, pos, index=index, *args, **kw)
         self._index = index
@@ -2379,6 +2406,25 @@ class IndexNode(ExprNode):
         base = self.base
         return (base.is_simple() and self.index.is_simple()
                 and base.type and (base.type.is_ptr or base.type.is_array))
+
+    def is_memslice_attr_access(self):
+        """
+        Returns True when indexing the attributes of a memoryview slice
+        """
+        return self.type.is_memslice and (
+            self.obj.is_attribute and
+            self.obj.attribute in ('shape', 'strides', 'suboffsets'))
+
+    def has_sideeffects(self):
+        # This may be out an of bounds access or data may change at will,
+        # so assume side effects.
+
+        # In the case of accessing a memoryview slice's immutable attributes,
+        # assume no side effects (the caller should check whether the slice is
+        # reassigned between any code reorder and the actual reference)
+
+        return (super(IndexNode, self).has_sideeffects() or not
+                self.is_memslice_attr_access())
 
     def analyse_target_declaration(self, env):
         pass
@@ -3152,6 +3198,49 @@ class IndexNode(ExprNode):
         code.putln("}")
 
 
+class BoundsCheckList(ExprNode):
+    """
+    loop_node       ForInStatNode/ParallelRangeNode/ForFromStatNode
+    boundschecks    [BoundsCheckNode]
+    """
+
+class BoundsCheckNode(ExprNode):
+    """
+    Perform boundschecking and wraparound when pulled out of loops.
+
+    index
+        the index in the buffer
+
+    target
+        set to the target iteration index when the index into the buffer
+        depends on it
+
+    target_wrapper
+        wrapper node wrapping target, so the target can be replaced by another node
+
+    lower_bound/upper_bound
+        lower/upper bound of iteration variable in the loop
+
+    error_path_label
+    """
+
+    child_attrs = []
+
+    def _sub(self, replacement):
+        OptimizableExpression(self.index, {}, self.target,
+            replace_target=self.lower_bound)
+
+    def generate_result_code(self, code):
+        if self.depends_on_target:
+            self.target_wrapper.node = lower_bound
+            self.generate_bounds_code(code)
+
+            self.target_wrapper.node = upper_bound
+            self.generate_bounds_code(code)
+
+    def generate_bounds_code(self, code):
+        pass
+
 class SliceIndexNode(ExprNode):
     #  2-element slice indexing
     #
@@ -3495,6 +3584,11 @@ class CallNode(ExprNode):
         if self.may_return_none is not None:
             return self.may_return_none
         return ExprNode.may_be_none(self)
+
+    def has_sideeffects(self):
+        # maybe try looking up the function and see whether its body has
+        # any side effects
+        return True
 
     def analyse_as_type_constructor(self, env):
         type = self.function.analyse_as_type(env)
@@ -5273,6 +5367,9 @@ class ScopedExprNode(ExprNode):
     def analyse_types(self, env):
         # no recursion here, the children will be analysed separately below
         pass
+
+    def has_sideeffects(self):
+        return True
 
     def analyse_scoped_expressions(self, env):
         # this is called with the expr_scope as env
@@ -7482,6 +7579,10 @@ class BinopNode(ExprNode):
         return (self.operand1.type.is_cpp_class
             or self.operand2.type.is_cpp_class)
 
+    def has_sideeffects(self):
+        return (self.is_py_operation() or self.is_cpp_operation() or
+                super(BinopNode, self).has_sideeffects())
+
     def analyse_cpp_operation(self, env):
         type1 = self.operand1.type
         type2 = self.operand2.type
@@ -7980,6 +8081,10 @@ class BoolBinopNode(ExprNode):
         else:
             return self.operand1.may_be_none() or self.operand2.may_be_none()
 
+    def has_sideeffects(self):
+        return (not self.operand1.is_literal or
+                super(BoolBinopNode, self).has_sideeffects())
+
     def calculate_constant_result(self):
         if self.operator == 'and':
             self.constant_result = \
@@ -8117,6 +8222,10 @@ class CondExprNode(ExprNode):
             and self.true_val.check_const()
             and self.false_val.check_const())
 
+    def has_sideeffects(self):
+        return (not self.test.is_literal or
+                super(CondExprNode, self).has_sideeffects())
+
     def generate_evaluation_code(self, code):
         # Because subexprs may not be evaluated we can use a more optimal
         # subexpr allocation strategy than the default, so override evaluation_code.
@@ -8187,6 +8296,9 @@ class CmpNode(object):
 
     def is_cpp_comparison(self):
         return self.operand1.type.is_cpp_class or self.operand2.type.is_cpp_class
+
+    def has_sideeffects(self):
+        return ExprNode.has_sideeffects() or self.is_cpp_comparison()
 
     def find_common_int_type(self, env, op, operand1, operand2):
         # type1 != type2 and at least one of the types is not a C int

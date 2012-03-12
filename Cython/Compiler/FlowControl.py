@@ -850,10 +850,9 @@ class ControlFlowAnalysis(CythonTransform):
 
         # Body block
         if isinstance(node, Nodes.ParallelRangeNode):
-            # In case of an invalid
             self._delete_privates(node, exclude=node.target.entry)
 
-        self.flow.nextblock()
+        body_block = self.flow.nextblock()
         self.visit(node.body)
         self.flow.loops.pop()
 
@@ -873,6 +872,9 @@ class ControlFlowAnalysis(CythonTransform):
             self.flow.block = next_block
         else:
             self.flow.block = None
+
+        # todo: implement SSA
+        node.assignments = body_block.gen
         return node
 
     def _delete_privates(self, node, exclude=None):
