@@ -1666,6 +1666,120 @@ class InlineDefNodeCalls(Visitor.CythonTransform):
             return inlined
         return node
 
+class OptimizableExpression(Visitor.CythonTransform):
+    "Figure out whether a buffer index expression can be pulled out of a loop"
+
+    def __init__(self, index, assignments, loop_targets, replace_targets=None):
+        """
+        target_index is the iteration index variable, and replace_target indicates whether
+        it should be replaced with another node. When the expression gets pulled out of the
+        loop you want to replace the target with the possible lower bound and possible
+        upper bound.
+        """
+        super(OptimizableExpression, self).__init__(None)
+
+        self.assignments = assignments
+        self.loop_targets = loop_targets
+        self.replace_targets = replace_targets
+        self.valid = True
+
+        self.visit_Node(index)
+
+    def visit_NameNode(self, node):
+        loop_target = self.loop_targets.get(node.name)
+        if self.replace_targets and node.name in self.replace_targets:
+            node = self.replace_targets[node.name]
+
+        self.valid = _usable_name(node, self.assignments)
+        return node
+
+    def visit_ExprNode(self, node):
+        self.visitchildren(node)
+        return node
+
+def _usable_name(namenode, assignments):
+     return not (namenode.entry.is_local or
+                 namenode.entry.address_taken or
+                 node.entry.name in assignments)
+
+def _can_optimize_boundscheck(indexnode, index, assignments, loop_targets):
+    if not indexnode.base.is_name or not _usable_name(indexnode.base, assignments):
+        return False
+
+    # valid IndexNode, now check the index
+    return OptimizableExpression(index, assignments, loop_targets).valid
+
+
+class OptimizeBoundsChecking(Visitor.CythonTransform):
+    """
+    Pull bound checks for buffers and wraparound code outside of loops.
+    If an error is detected outside of the loop, no exception may be raised
+    as the faulty index may be guarded, short circuited, etc, and any preceding
+    iterations and code must be executed. So instead we need an error path with
+    bounds checking enabled, and a normal path without.
+
+    Perform optimization iff
+        - variables used in the index expression are locals
+        - their address is not taken in the function
+        - the variables are not reassigned in the loop
+        - the index variable may be reassigned only after the indexing operation
+          (as it is overwritten every iteration)
+        - the expression does not have side effects (C type, no nested indexing)
+    """
+
+    def visit_ModuleNode(self, node):
+        # { varname -> (lower_bound, upper_bound) }
+        self.loop_targets = {}
+        self.loop_level = 0
+        self.indexnodes = []
+        self.assignments = set()
+
+    def optimize_boundscheck(self, node):
+        optimized = []
+        for indexnode in self.indexnodes:
+            for dim, index in enumerate(indexnode.indices):
+                if (not index.has_sideeffects() and
+                    _can_optimize_boundscheck(indexnode, index, self.assignments,
+                                              self.loop_targets):
+                    boundscheck = BoundsChecknode(index.pos, indexnode=indexnode.base,
+                                                  index=index, dim=dim, env=self.env)
+                    optimized.append(boundscheck)
+                    index.boundscheck = boundscheck
+
+        return optimized
+
+    def visit_ForFromStatNode(self, node):
+        if not self.env.directives['boundscheck']:
+            return node
+
+        if node.target.is_name:
+            self.loop_targets.add(node.target.name)
+        self.loop_level += 1
+        assignments = self.assignments
+        self.assignments = set(assignments)
+        self.assignments.update(node.assignments)
+        self.visitchildren(node)
+        self.assignments = assignments
+        self.loop_level -= 1
+        if node.target.is_name:
+            self.loop_targets.remove(node.target.name)
+
+        if loop_level == 0:
+            stats = self.optimize_boundschecks(self.boundschecks)
+            stats.append(node)
+            self.boundschecks = []
+            node = StatListNode(node.pos, stats=stats)
+
+        return node
+
+    def visit_IndexNode(self, node):
+        if self.loop_level >= 1:
+            node = self.visit_Node(node)
+            if node.memslice_index and not node.memslice_slice:
+                self.indexnodes.append(node)
+
+        return node
+
 
 class OptimizeBuiltinCalls(Visitor.EnvTransform):
     """Optimize some common methods calls and instantiation patterns
