@@ -20,6 +20,8 @@ from Cython.Compiler.Errors import error, warning, CompileError, InternalError
 from Cython.Compiler.Code import UtilityCode
 from Cython.Compiler.NumpySupport import (should_apply_numpy_hack,
                                           numpy_transform_attribute_node)
+from Cython.Compiler import Importer
+
 import copy
 
 
@@ -1489,7 +1491,8 @@ if VALUE is not None:
 
                 return node
 
-            node = Nodes.FusedCFuncDefNode(node, env)
+            FusedNode = Importer.importer("Cython.Compiler.FusedNode", version=(2, 5))
+            node = FusedNode.FusedCFuncDefNode(node, env)
 
             self.fused_function = node
             self.visitchildren(node)
