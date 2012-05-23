@@ -18,6 +18,7 @@ from Cython.Compiler.TreeFragment import TreeFragment
 from Cython.Compiler.StringEncoding import EncodedString
 from Cython.Compiler.Errors import error, warning, CompileError, InternalError
 from Cython.Compiler.Code import UtilityCode
+from Cython.Compiler import Vector
 
 import copy
 
@@ -1787,9 +1788,6 @@ class AnalyseExpressionsTransform(CythonTransform):
             # We split IndexNode into BufferIndexNode, etc
             # Todo: rewrite analyse_types as a transform
             node = node.replacement_node
-            #if node.is_memview_slice and node.is_ellipsis_noop:
-                # memoryviewslice[...] expression, drop the IndexNode
-            #    node = node.base
             return self.visit_Node(node)
 
         self.visit_Node(node)
@@ -1799,6 +1797,26 @@ class AnalyseExpressionsTransform(CythonTransform):
 
         return node
 
+from Cython.Compiler import Vector
+
+class ElementWiseOperationsTransform(CythonTransform):
+
+    in_elemental = 0
+
+    def visit_ModuleNode(self, node):
+        self.element_builder = Vector.Context()
+        self.visitchildren(node)
+
+    def visit_BinopNode(self, node):
+        if node.is_elemental_operation:
+            self.in_elemental += 1
+        self.visitchildren(node)
+        # need to do some additional wrapping here...
+        node = self.element_builder.map_node(node)
+        if node.is_elemental_operation:
+            self.in_elemental -= 1
+
+        return node
 
 class FindInvalidUseOfFusedTypes(CythonTransform):
 
