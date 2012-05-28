@@ -146,7 +146,7 @@ def create_pipeline(context, mode, exclude_classes=()):
     from Optimize import DropRefcountingTransform
     from Buffer import IntroduceBufferAuxiliaryVars
     from ModuleNode import check_c_declarations, check_c_declarations_pxd
-
+    from Cython.Compiler.Vector import ElementWiseOperationsTransform
 
     if mode == 'pxd':
         _check_c_declarations = check_c_declarations_pxd
@@ -192,6 +192,7 @@ def create_pipeline(context, mode, exclude_classes=()):
         _check_c_declarations,
         InlineDefNodeCalls(context),
         AnalyseExpressionsTransform(context),
+        ElementWiseOperationsTransform(context),
         FindInvalidUseOfFusedTypes(context),
         CreateClosureClasses(context),  ## After all lookups and type inference
         ExpandInplaceOperators(context),
