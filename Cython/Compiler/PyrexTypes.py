@@ -636,7 +636,7 @@ class MemoryViewSliceType(PyrexType):
 
         src = self
 
-        if src.dtype != dst.dtype:
+        if src.dtype.resolve() != dst.dtype.resolve():
             return False
 
         if src.ndim != dst.ndim:

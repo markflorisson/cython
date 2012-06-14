@@ -447,6 +447,10 @@ class ExprNode(Node):
     def addr_not_const(self):
         error(self.pos, "Address is not constant")
 
+    def wrap_in_clone_node(self):
+        "Return a CloneNode for this node"
+        return CloneNode(ProxyNode(self))
+
     # ----------------- Result Allocation -----------------
 
     def result_in_temp(self):
@@ -659,6 +663,7 @@ class ExprNode(Node):
 
         if dst_type.is_memoryviewslice:
             import MemoryView
+
             if not src.type.is_memoryviewslice:
                 if src.type.is_pyobject:
                     src = CoerceToMemViewSliceNode(src, dst_type, env)
@@ -669,9 +674,9 @@ class ExprNode(Node):
                     error(self.pos,
                           "Cannot convert '%s' to memoryviewslice" %
                                                                 (src_type,))
-            elif not src.type.conforms_to(dst_type,
-                                          broadcast=self.is_memview_broadcast,
-                                          copying=self.is_memview_copy_assignment):
+            elif not src.type.conforms_to(
+                    dst_type, broadcast=self.is_memview_broadcast,
+                    copying=self.is_memview_copy_assignment):
                 if src.type.dtype.same_as(dst_type.dtype):
                     msg = "Memoryview '%s' not conformable to memoryview '%s'."
                     tup = src.type, dst_type
@@ -3510,7 +3515,6 @@ class MemoryCopyScalar(MemoryCopyNode):
 
         slice_iter_obj.end_loops()
         code.end_block()
-
 
 class SliceIndexNode(ExprNode):
     #  2-element slice indexing
