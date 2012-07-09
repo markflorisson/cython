@@ -7958,6 +7958,13 @@ class BinopNode(ExprNode):
 
         ndim = max(ndim1, ndim2)
         dtype = self.result_type(dtype1, dtype2)
+        if dtype is None:
+            if dtype1.same_as(dtype2):
+                dtype = dtype1
+            else:
+                error(self.pos,
+                      "Unsupported types in binary operation (%s, %s)" %
+                                                            (dtype1, dtype2))
         axes = [('direct', 'strided')] * ndim
         self.type = PyrexTypes.MemoryViewSliceType(dtype, axes)
         self.is_elemental = True
@@ -8242,7 +8249,7 @@ class DivNode(NumBinopNode):
         else:
             self.ctruedivision = self.truedivision
         NumBinopNode.analyse_operation(self, env)
-        if self.is_cpp_operation():
+        if self.is_cpp_operation() or self.is_elemental:
             self.cdivision = True
         if not self.type.is_pyobject:
             self.zerodivision_check = (
@@ -9668,6 +9675,9 @@ class CoerceToComplexNode(CoercionNode):
         self.type = dst_type
         CoercionNode.__init__(self, arg)
         dst_type.create_declaration_utility_code(env)
+
+    def analyse_types(self, env):
+        self.arg.analyse_types(env)
 
     def calculate_result_code(self):
         if self.arg.type.is_complex:
