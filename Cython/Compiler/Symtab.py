@@ -484,18 +484,21 @@ class Scope(object):
         return entry
 
     def declare_cpp_class(self, name, scope,
-            pos, cname = None, base_classes = [],
+            pos, cname = None, base_classes = (),
             visibility = 'extern', templates = None):
-        if visibility != 'extern':
-            error(pos, "C++ classes may only be extern")
         if cname is None:
-            cname = name
+            if self.in_cinclude or (visibility != 'private'):
+                cname = name
+            else:
+                cname = self.mangle(Naming.type_prefix, name)
+        base_classes = list(base_classes)
         entry = self.lookup_here(name)
         if not entry:
             type = PyrexTypes.CppClassType(
                 name, scope, cname, base_classes, templates = templates)
             entry = self.declare_type(name, type, pos, cname,
                 visibility = visibility, defining = scope is not None)
+            self.sue_entries.append(entry)
         else:
             if not (entry.is_type and entry.type.is_cpp_class):
                 error(pos, "'%s' redeclared " % name)
@@ -507,17 +510,13 @@ class Scope(object):
                     entry.type.scope = scope
                     self.type_entries.append(entry)
             if base_classes:
-                if entry.type.base_classes and not entry.type.base_classes == base_classes:
+                if entry.type.base_classes and entry.type.base_classes != base_classes:
                     error(pos, "Base type does not match previous declaration")
                 else:
                     entry.type.base_classes = base_classes
             if templates or entry.type.templates:
                 if templates != entry.type.templates:
                     error(pos, "Template parameters do not match previous declaration")
-        if templates is not None and entry.type.scope is not None:
-            for T in templates:
-                template_entry = entry.type.scope.declare(T.name, T.name, T, None, 'extern')
-                template_entry.is_type = 1
 
         def declare_inherited_attributes(entry, base_classes):
             for base_class in base_classes:
@@ -528,6 +527,7 @@ class Scope(object):
                     entry.type.scope.declare_inherited_cpp_attributes(base_class.scope)
         if entry.type.scope:
             declare_inherited_attributes(entry, base_classes)
+            entry.type.scope.declare_var(name="this", cname="this", type=PyrexTypes.CPtrType(entry.type), pos=entry.pos)
         if self.is_cpp_class_scope:
             entry.type.namespace = self.outer_scope.lookup(self.name).type
         return entry
@@ -961,6 +961,7 @@ class ModuleScope(Scope):
     # has_import_star      boolean            Module contains import *
     # cpp                  boolean            Compiling a C++ file
     # is_cython_builtin    boolean            Is this the Cython builtin scope (or a child scope)
+    # is_package           boolean            Is this a package module? (__init__)
 
     is_module_scope = 1
     has_import_star = 0
@@ -971,12 +972,14 @@ class ModuleScope(Scope):
         self.parent_module = parent_module
         outer_scope = Builtin.builtin_scope
         Scope.__init__(self, name, outer_scope, parent_module)
-        if name != "__init__":
-            self.module_name = name
-        else:
+        if name == "__init__":
             # Treat Spam/__init__.pyx specially, so that when Python loads
             # Spam/__init__.so, initSpam() is defined.
             self.module_name = parent_module.module_name
+            self.is_package = True
+        else:
+            self.module_name = name
+            self.is_package = False
         self.module_name = EncodedString(self.module_name)
         self.context = context
         self.module_cname = Naming.module_cname
@@ -1992,24 +1995,36 @@ class CppClassScope(Scope):
     is_cpp_class_scope = 1
 
     default_constructor = None
+    type = None
 
-    def __init__(self, name, outer_scope):
+    def __init__(self, name, outer_scope, templates=None):
         Scope.__init__(self, name, outer_scope, None)
         self.directives = outer_scope.directives
         self.inherited_var_entries = []
+        if templates is not None:
+            for T in templates:
+                template_entry = self.declare(
+                    T, T, PyrexTypes.TemplatePlaceholderType(T), None, 'extern')
+                template_entry.is_type = 1
 
     def declare_var(self, name, type, pos,
                     cname = None, visibility = 'extern',
                     api = 0, in_pxd = 0, is_cdef = 0,
-                    allow_pyobject = 0):
+                    allow_pyobject = 0, defining = 0):
         # Add an entry for an attribute.
         if not cname:
             cname = name
-        if type.is_cfunction:
-            type = PyrexTypes.CPtrType(type)
-        entry = self.declare(name, cname, type, pos, visibility)
+        entry = self.lookup_here(name)
+        if defining and entry is not None:
+            if not entry.type.same_as(type):
+                error(pos, "Function signature does not match previous declaration")
+        else:
+            entry = self.declare(name, cname, type, pos, visibility)
         entry.is_variable = 1
-        self.var_entries.append(entry)
+        if type.is_cfunction and self.type:
+            entry.func_cname = "%s::%s" % (self.type.declaration_code(""), cname)
+        if name != "this" and (defining or name != "<init>"):
+            self.var_entries.append(entry)
         if type.is_pyobject and not allow_pyobject:
             error(pos,
                 "C++ class member cannot be a Python object")
@@ -2019,10 +2034,12 @@ class CppClassScope(Scope):
         # Look for default constructors in all base classes.
         if self.default_constructor is None:
             entry = self.lookup(self.name)
-            if len(entry.type.base_classes) == 0:
+            if not entry.type.base_classes:
                 self.default_constructor = True
                 return
             for base_class in entry.type.base_classes:
+                if base_class is PyrexTypes.error_type:
+                    continue
                 temp_entry = base_class.scope.lookup_here("<init>")
                 found = False
                 if temp_entry is None:
@@ -2031,7 +2048,7 @@ class CppClassScope(Scope):
                     type = alternative.type
                     if type.is_ptr:
                         type = type.base_type
-                    if len(type.args) == 0:
+                    if not type.args:
                         found = True
                         break
                 if not found:
@@ -2045,14 +2062,20 @@ class CppClassScope(Scope):
     def declare_cfunction(self, name, type, pos,
                           cname = None, visibility = 'extern', api = 0, in_pxd = 0,
                           defining = 0, modifiers = (), utility_code = None):
-        if name == self.name.split('::')[-1] and cname is None:
+        if name in (self.name.split('::')[-1], '__init__') and cname is None:
             self.check_base_default_constructor(pos)
+            cname = self.type.cname
             name = '<init>'
-            type.return_type = self.lookup(self.name).type
+            type.return_type = PyrexTypes.InvisibleVoidType()
+        elif name == '__dealloc__' and cname is None:
+            cname = "~%s" % self.type.cname
+            name = '<del>'
+            type.return_type = PyrexTypes.InvisibleVoidType()
         prev_entry = self.lookup_here(name)
         entry = self.declare_var(name, type, pos,
+                                 defining=defining,
                                  cname=cname, visibility=visibility)
-        if prev_entry:
+        if prev_entry and not defining:
             entry.overloaded_alternatives = prev_entry.all_alternatives()
         entry.utility_code = utility_code
         type.entry = entry

@@ -1162,7 +1162,7 @@ class CStructOrUnionDefNode(StatNode):
         pass
 
 
-class CppClassNode(CStructOrUnionDefNode):
+class CppClassNode(CStructOrUnionDefNode, BlockNode):
 
     #  name          string
     #  cname         string or None
@@ -1170,10 +1170,12 @@ class CppClassNode(CStructOrUnionDefNode):
     #  in_pxd        boolean
     #  attributes    [CVarDefNode] or None
     #  entry         Entry
-    #  base_classes  [string]
+    #  base_classes  [CBaseTypeNode]
     #  templates     [string] or None
 
     def declare(self, env):
+        if self.visibility != 'extern' and not env.directives['experimental_cpp_class_def']:
+            error(self.pos, "C++ classes need to be declared extern unless experimental_cpp_class_def enabled")
         if self.templates is None:
             template_types = None
         else:
@@ -1185,16 +1187,8 @@ class CppClassNode(CStructOrUnionDefNode):
     def analyse_declarations(self, env):
         scope = None
         if self.attributes is not None:
-            scope = CppClassScope(self.name, env)
-        base_class_types = []
-        for base_class_name in self.base_classes:
-            base_class_entry = env.lookup(base_class_name)
-            if base_class_entry is None:
-                error(self.pos, "'%s' not found" % base_class_name)
-            elif not base_class_entry.is_type or not base_class_entry.type.is_cpp_class:
-                error(self.pos, "'%s' is not a cpp class type" % base_class_name)
-            else:
-                base_class_types.append(base_class_entry.type)
+            scope = CppClassScope(self.name, env, templates = self.templates)
+        base_class_types = [b.analyse(scope or env) for b in self.base_classes]
         if self.templates is None:
             template_types = None
         else:
@@ -1205,11 +1199,32 @@ class CppClassNode(CStructOrUnionDefNode):
         if self.entry is None:
             return
         self.entry.is_cpp_class = 1
+        scope.type = self.entry.type
+        defined_funcs = []
         if self.attributes is not None:
             if self.in_pxd and not env.in_cinclude:
                 self.entry.defined_in_pxd = 1
             for attr in self.attributes:
                 attr.analyse_declarations(scope)
+                if isinstance(attr, CFuncDefNode):
+                    defined_funcs.append(attr)
+                    if self.templates is not None:
+                        attr.template_declaration = "template <typename %s>" % ", typename ".join(self.templates)
+        self.body = StatListNode(self.pos, stats=defined_funcs)
+        self.scope = scope
+
+    def analyse_expressions(self, env):
+        self.body.analyse_expressions(self.entry.type.scope)
+
+    def generate_function_definitions(self, env, code):
+        self.body.generate_function_definitions(self.entry.type.scope, code)
+
+    def generate_execution_code(self, code):
+        self.body.generate_execution_code(code)
+
+    def annotate(self, code):
+        self.body.annotate(code)
+
 
 class CEnumDefNode(StatNode):
     #  name           string or None
@@ -1924,6 +1939,7 @@ class CFuncDefNode(FuncDefNode):
     #  py_func       wrapper for calling from Python
     #  overridable   whether or not this is a cpdef function
     #  inline_in_pxd whether this is an inline function in a pxd file
+    #  template_declaration  String or None   Used for c++ class methods
 
     child_attrs = ["base_type", "declarator", "body", "py_func"]
 
@@ -1932,6 +1948,7 @@ class CFuncDefNode(FuncDefNode):
     directive_locals = None
     directive_returns = None
     override = None
+    template_declaration = None
 
     def unqualified_name(self):
         return self.entry.name
@@ -2130,7 +2147,7 @@ class CFuncDefNode(FuncDefNode):
         if cname is None:
             cname = self.entry.func_cname
         entity = type.function_header_code(cname, ', '.join(arg_decls))
-        if self.entry.visibility == 'private':
+        if self.entry.visibility == 'private' and '::' not in cname:
             storage_class = "static "
         else:
             storage_class = ""
@@ -2139,6 +2156,8 @@ class CFuncDefNode(FuncDefNode):
 
         header = self.return_type.declaration_code(entity, dll_linkage=dll_linkage)
         #print (storage_class, modifiers, header)
+        if self.template_declaration:
+            code.putln(self.template_declaration)
         code.putln("%s%s%s {" % (storage_class, modifiers, header))
 
     def generate_argument_declarations(self, env, code):
@@ -2642,6 +2661,8 @@ class DefNode(FuncDefNode):
             for decorator in self.decorators[::-1]:
                 decorator.decorator.analyse_expressions(env)
 
+        self.py_wrapper.prepare_argument_coercion(env)
+
     def needs_assignment_synthesis(self, env, code=None):
         if self.is_wrapper or self.specialized_cpdefs or self.entry.is_fused_specialized:
             return False
@@ -2765,6 +2786,16 @@ class DefNodeWrapper(FuncDefNode):
         target_entry.pymethdef_cname = Naming.pymethdef_prefix + prefix + name
 
         self.signature = target_entry.signature
+
+    def prepare_argument_coercion(self, env):
+        # This is only really required for Cython utility code at this time,
+        # everything else can be done during code generation.  But we expand
+        # all utility code here, simply because we cannot easily distinguish
+        # different code types.
+        for arg in self.args:
+            if not arg.type.is_pyobject:
+                if not arg.type.create_from_py_utility_code(env):
+                    pass # will fail later
 
     def signature_has_nongeneric_args(self):
         argcount = len(self.args)
@@ -4541,7 +4572,8 @@ class InPlaceAssignmentNode(AssignmentNode):
         if isinstance(self.lhs, ExprNodes.IndexNode) and self.lhs.is_buffer_access:
             if self.lhs.type.is_pyobject:
                 error(self.pos, "In-place operators not allowed on object buffers in this release.")
-            if c_op in ('/', '%') and self.lhs.type.is_int and not code.directives['cdivision']:
+            if (c_op in ('/', '%') and self.lhs.type.is_int
+                and not code.globalstate.directives['cdivision']):
                 error(self.pos, "In-place non-c divide operators not allowed on int buffers.")
             self.lhs.generate_buffer_setitem_code(self.rhs, code, c_op)
         else:
@@ -6366,6 +6398,12 @@ class EnsureGILNode(GILExitNode):
     def generate_execution_code(self, code):
         code.put_ensure_gil(declare_gilstate=False)
 
+utility_code_for_cimports = {
+    # utility code (or inlining c) in a pxd (or pyx) file.
+    # TODO: Consider a generic user-level mechanism for importing
+    'cpython.array'         : ("ArrayAPI", "arrayarray.h"),
+    'cpython.array.array'   : ("ArrayAPI", "arrayarray.h"),
+}
 
 class CImportStatNode(StatNode):
     #  cimport statement
@@ -6397,10 +6435,9 @@ class CImportStatNode(StatNode):
         else:
             name = self.as_name or self.module_name
             env.declare_module(name, module_scope, self.pos)
-        if self.module_name == "cpython.array":
-            # TODO: Consider a generic user-level mechanism for importing
-            # utility code (or inlining c) in a pxd (or pyx) file.
-            env.use_utility_code(UtilityCode.load("ArrayAPI", "arrayarray.h"))
+        if self.module_name in utility_code_for_cimports:
+            env.use_utility_code(UtilityCode.load_cached(
+                *utility_code_for_cimports[self.module_name]))
 
     def analyse_expressions(self, env):
         pass
@@ -6451,12 +6488,16 @@ class FromCImportStatNode(StatNode):
                 if entry:
                     local_name = as_name or name
                     env.add_imported_entry(local_name, entry, pos)
-        if self.module_name == "cpython":
-            # TODO: Consider a generic user-level mechanism for importing
-            # utility code (or inlining c) in a pxd (or pyx) file.
+
+        if self.module_name.startswith('cpython'): # enough for now
+            if self.module_name in utility_code_for_cimports:
+                env.use_utility_code(UtilityCode.load_cached(
+                    *utility_code_for_cimports[self.module_name]))
             for _, name, _, _ in self.imported_names:
-                if name == "array":
-                    env.use_utility_code(UtilityCode.load("ArrayAPI", "arrayarray.h"))
+                fqname = '%s.%s' % (self.module_name, name)
+                if fqname in utility_code_for_cimports:
+                    env.use_utility_code(UtilityCode.load_cached(
+                        *utility_code_for_cimports[fqname]))
 
     def declaration_matches(self, entry, kind):
         if not entry.is_type:

@@ -1,6 +1,7 @@
 # tag: cpp
 
 from libcpp.vector cimport vector
+from cython.operator cimport dereference as deref
 
 cdef extern from "cpp_iterators_simple.h":
     cdef cppclass DoublePointerIter:
@@ -48,3 +49,46 @@ def test_custom():
         return [x for x in iter[0]]
     finally:
         del iter
+
+def test_iteration_over_heap_vector(L):
+    """
+    >>> test_iteration_over_heap_vector([1,2])
+    [1, 2]
+    """
+    cdef int i
+    cdef vector[int] *vint = new vector[int]()
+    try:
+        for i in L:
+            vint.push_back(i)
+        return [ i for i in deref(vint) ]
+    finally:
+        del vint
+
+def test_iteration_in_generator(vector[int] vint):
+    """
+    >>> list( test_iteration_in_generator([1,2]) )
+    [1, 2]
+    """
+    for i in vint:
+        yield i
+
+def test_iteration_in_generator_reassigned():
+    """
+    >>> list( test_iteration_in_generator_reassigned() )
+    [1]
+    """
+    cdef vector[int] *vint = new vector[int]()
+    cdef vector[int] *orig_vint = vint
+    vint.push_back(1)
+    reassign = True
+    try:
+        for i in deref(vint):
+            yield i
+            if reassign:
+                reassign = False
+                vint = new vector[int]()
+                vint.push_back(2)
+    finally:
+        del orig_vint
+        if vint is not orig_vint:
+            del vint

@@ -1213,6 +1213,19 @@ class CVoidType(CType):
     def is_complete(self):
         return 0
 
+class InvisibleVoidType(CVoidType):
+    #
+    #   For use with C++ constructors and destructors return types.
+    #   Acts like void, but does not print out a declaration.
+    #
+    def declaration_code(self, entity_code,
+            for_display = 0, dll_linkage = None, pyrex = 0):
+        if pyrex or for_display:
+            base_code = "[void]"
+        else:
+            base_code = public_decl("", dll_linkage)
+        return self.base_declaration_code(base_code, entity_code)
+
 
 class CNumericType(CType):
     #
@@ -3004,6 +3017,11 @@ class CppClassType(CType):
     has_attributes = 1
     exception_check = True
     namespace = None
+    
+    # For struct-like declaration.
+    kind = "struct"
+    packed = False
+    typedef_flag = False
 
     subtypes = ['templates']
 
@@ -3139,7 +3157,6 @@ class CppClassType(CType):
         return self.base_declaration_code(base_code, entity_code)
 
     def is_subclass(self, other_type):
-        # TODO(danilo): Handle templates.
         if self.same_as_resolved_type(other_type):
             return 1
         for base_class in self.base_classes:
@@ -3151,7 +3168,8 @@ class CppClassType(CType):
         if other_type.is_cpp_class:
             if self == other_type:
                 return 1
-            elif self.template_type and other_type.template_type:
+            elif (self.cname == other_type.cname and
+                  self.template_type and other_type.template_type):
                 if self.templates == other_type.templates:
                     return 1
                 for t1, t2 in zip(self.templates, other_type.templates):

@@ -34,7 +34,7 @@ import Symtab
 import Options
 from Cython import Utils
 from Annotate import AnnotationItem
-
+from Cython.Compiler import Future
 from Cython.Debugging import print_call_chain
 from DebugFlags import debug_disposal_code, debug_temp_alloc, \
     debug_coercion
@@ -1329,9 +1329,8 @@ class NewExprNode(AtomicExprNode):
         self.cpp_check(env)
         constructor = type.scope.lookup(u'<init>')
         if constructor is None:
-            return_type = PyrexTypes.CFuncType(type, [], exception_check='+')
-            return_type = PyrexTypes.CPtrType(return_type)
-            type.scope.declare_cfunction(u'<init>', return_type, self.pos)
+            func_type = PyrexTypes.CFuncType(type, [], exception_check='+')
+            type.scope.declare_cfunction(u'<init>', func_type, self.pos)
             constructor = type.scope.lookup(u'<init>')
         self.class_type = type
         self.entry = constructor
@@ -1933,7 +1932,8 @@ class ImportNode(ExprNode):
 
     def analyse_types(self, env):
         if self.level is None:
-            if env.directives['language_level'] < 3 or env.directives['py2_import']:
+            if (env.directives['py2_import'] or
+                Future.absolute_import not in env.global_scope().context.future_directives):
                 self.level = -1
             else:
                 self.level = 0
@@ -1972,6 +1972,7 @@ class IteratorNode(ExprNode):
     type = py_object_type
     iter_func_ptr = None
     counter_cname = None
+    cpp_iterator_cname = None
     reversed = False      # currently only used for list/tuple types (see Optimize.py)
 
     subexprs = ['sequence']
@@ -2008,7 +2009,7 @@ class IteratorNode(ExprNode):
         elif sequence_type.is_cpp_class:
             begin = sequence_type.scope.lookup("begin")
             if begin is not None:
-                return begin.type.base_type.return_type
+                return begin.type.return_type
         elif sequence_type.is_pyobject:
             return sequence_type
         return py_object_type
@@ -2020,25 +2021,23 @@ class IteratorNode(ExprNode):
         begin = sequence_type.scope.lookup("begin")
         end = sequence_type.scope.lookup("end")
         if (begin is None
-            or not begin.type.is_ptr
-            or not begin.type.base_type.is_cfunction
-            or begin.type.base_type.args):
+            or not begin.type.is_cfunction
+            or begin.type.args):
             error(self.pos, "missing begin() on %s" % self.sequence.type)
             self.type = error_type
             return
         if (end is None
-            or not end.type.is_ptr
-            or not end.type.base_type.is_cfunction
-            or end.type.base_type.args):
+            or not end.type.is_cfunction
+            or end.type.args):
             error(self.pos, "missing end() on %s" % self.sequence.type)
             self.type = error_type
             return
-        iter_type = begin.type.base_type.return_type
+        iter_type = begin.type.return_type
         if iter_type.is_cpp_class:
             if env.lookup_operator_for_types(
                     self.pos,
                     "!=",
-                    [iter_type, end.type.base_type.return_type]) is None:
+                    [iter_type, end.type.return_type]) is None:
                 error(self.pos, "missing operator!= on result of begin() on %s" % self.sequence.type)
                 self.type = error_type
                 return
@@ -2052,19 +2051,27 @@ class IteratorNode(ExprNode):
                 return
             self.type = iter_type
         elif iter_type.is_ptr:
-            if not (iter_type == end.type.base_type.return_type):
+            if not (iter_type == end.type.return_type):
                 error(self.pos, "incompatible types for begin() and end()")
             self.type = iter_type
         else:
             error(self.pos, "result type of begin() on %s must be a C++ class or pointer" % self.sequence.type)
             self.type = error_type
             return
-    
+
     def generate_result_code(self, code):
         sequence_type = self.sequence.type
         if sequence_type.is_cpp_class:
+            if self.sequence.is_name:
+                # safe: C++ won't allow you to reassign to class references
+                begin_func = "%s.begin" % self.sequence.result()
+            else:
+                sequence_type = PyrexTypes.c_ptr_type(sequence_type)
+                self.cpp_iterator_cname = code.funcstate.allocate_temp(sequence_type, manage_ref=False)
+                code.putln("%s = &%s;" % (self.cpp_iterator_cname, self.sequence.result()))
+                begin_func = "%s->begin" % self.cpp_iterator_cname
             # TODO: Limit scope.
-            code.putln("%s = %s.begin();" % (self.result(), self.sequence.result()))
+            code.putln("%s = %s();" % (self.result(), begin_func))
             return
         if sequence_type.is_array or sequence_type.is_ptr:
             raise InternalError("for in carray slice not transformed")
@@ -2149,10 +2156,14 @@ class IteratorNode(ExprNode):
         if self.reversed:
             code.putln("if (%s < 0) break;" % self.counter_cname)
         if sequence_type.is_cpp_class:
+            if self.cpp_iterator_cname:
+                end_func = "%s->end" % self.cpp_iterator_cname
+            else:
+                end_func = "%s.end" % self.sequence.result()
             # TODO: Cache end() call?
-            code.putln("if (!(%s != %s.end())) break;" % (
+            code.putln("if (!(%s != %s())) break;" % (
                             self.result(),
-                            self.sequence.result()));
+                            end_func))
             code.putln("%s = *%s;" % (
                             result_name,
                             self.result()))
@@ -2194,6 +2205,8 @@ class IteratorNode(ExprNode):
         if self.iter_func_ptr:
             code.funcstate.release_temp(self.iter_func_ptr)
             self.iter_func_ptr = None
+        if self.cpp_iterator_cname:
+            code.funcstate.release_temp(self.cpp_iterator_cname)
         ExprNode.free_temps(self, code)
 
 
@@ -2218,7 +2231,7 @@ class NextNode(AtomicExprNode):
         if iterator_type.is_ptr or iterator_type.is_array:
             return iterator_type.base_type
         elif iterator_type.is_cpp_class:
-            item_type = env.lookup_operator_for_types(self.pos, "*", [iterator_type]).type.base_type.return_type
+            item_type = env.lookup_operator_for_types(self.pos, "*", [iterator_type]).type.return_type
             if item_type.is_reference:
                 item_type = item_type.ref_base_type
             return item_type
@@ -2571,7 +2584,7 @@ class IndexNode(ExprNode):
             ]
             index_func = env.lookup_operator('[]', operands)
             if index_func is not None:
-                return index_func.type.base_type.return_type
+                return index_func.type.return_type
 
         # may be slicing or indexing, we don't know
         if base_type in (unicode_type, str_type):
@@ -3415,18 +3428,21 @@ class SliceIndexNode(ExprNode):
                   "Slicing is not currently supported for '%s'." % self.type)
             return
         if self.base.type.is_string:
+            base_result = self.base.result()
+            if self.base.type != PyrexTypes.c_char_ptr_type:
+                base_result = '((const char*)%s)' % base_result
             if self.stop is None:
                 code.putln(
                     "%s = PyBytes_FromString(%s + %s); %s" % (
                         self.result(),
-                        self.base.result(),
+                        base_result,
                         self.start_code(),
                         code.error_goto_if_null(self.result(), self.pos)))
             else:
                 code.putln(
                     "%s = PyBytes_FromStringAndSize(%s + %s, %s - %s); %s" % (
                         self.result(),
-                        self.base.result(),
+                        base_result,
                         self.start_code(),
                         self.stop_code(),
                         self.start_code(),
@@ -3688,6 +3704,7 @@ class CallNode(ExprNode):
             self.function.entry = constructor
             self.function.set_cname(type.declaration_code(""))
             self.analyse_c_function_call(env)
+            self.type = type
             return True
 
     def is_lvalue(self):
@@ -8511,6 +8528,9 @@ richcmp_constants = {
     "<>": "Py_NE",
     ">" : "Py_GT",
     ">=": "Py_GE",
+    # the following are faked by special compare functions
+    "in"    : "Py_EQ",
+    "not_in": "Py_NE",
 }
 
 class CmpNode(object):
@@ -8518,6 +8538,7 @@ class CmpNode(object):
     #  and CascadedCmpNodes.
 
     special_bool_cmp_function = None
+    special_bool_cmp_utility_code = None
 
     def infer_type(self, env):
         # TODO: Actually implement this (after merging with -unstable).
@@ -8696,34 +8717,51 @@ class CmpNode(object):
             return (container_type.is_ptr or container_type.is_array) \
                 and not container_type.is_string
 
-    def find_special_bool_compare_function(self, env):
+    def find_special_bool_compare_function(self, env, operand1):
+        # note: currently operand1 must get coerced to a Python object if we succeed here!
         if self.operator in ('==', '!='):
-            type1, type2 = self.operand1.type, self.operand2.type
-            if type1.is_pyobject and type2.is_pyobject:
+            type1, type2 = operand1.type, self.operand2.type
+            if type1.is_builtin_type and type2.is_builtin_type:
                 if type1 is Builtin.unicode_type or type2 is Builtin.unicode_type:
-                    env.use_utility_code(UtilityCode.load_cached("UnicodeEquals", "StringTools.c"))
+                    self.special_bool_cmp_utility_code = UtilityCode.load_cached("UnicodeEquals", "StringTools.c")
                     self.special_bool_cmp_function = "__Pyx_PyUnicode_Equals"
                     return True
                 elif type1 is Builtin.bytes_type or type2 is Builtin.bytes_type:
-                    env.use_utility_code(UtilityCode.load_cached("BytesEquals", "StringTools.c"))
+                    self.special_bool_cmp_utility_code = UtilityCode.load_cached("BytesEquals", "StringTools.c")
                     self.special_bool_cmp_function = "__Pyx_PyBytes_Equals"
                     return True
                 elif type1 is Builtin.str_type or type2 is Builtin.str_type:
-                    env.use_utility_code(UtilityCode.load_cached("StrEquals", "StringTools.c"))
+                    self.special_bool_cmp_utility_code = UtilityCode.load_cached("StrEquals", "StringTools.c")
                     self.special_bool_cmp_function = "__Pyx_PyString_Equals"
                     return True
+        elif self.operator in ('in', 'not_in'):
+            if self.operand2.type is Builtin.dict_type:
+                self.operand2 = self.operand2.as_none_safe_node("'NoneType' object is not iterable")
+                self.special_bool_cmp_utility_code = UtilityCode.load_cached("PyDictContains", "ObjectHandling.c")
+                self.special_bool_cmp_function = "__Pyx_PyDict_Contains"
+                return True
+            elif self.operand2.type.is_pyobject:
+                self.special_bool_cmp_utility_code = UtilityCode.load_cached("PySequenceContains", "ObjectHandling.c")
+                self.special_bool_cmp_function = "__Pyx_PySequence_Contains"
+                return True
         return False
 
     def generate_operation_code(self, code, result_code,
             operand1, op , operand2):
         if self.type.is_pyobject:
-            coerce_result = "__Pyx_PyBool_FromLong"
+            error_clause = code.error_goto_if_null
+            got_ref = "__Pyx_XGOTREF(%s); " % result_code
+            if self.special_bool_cmp_function:
+                code.globalstate.use_utility_code(
+                    UtilityCode.load_cached("PyBoolOrNullFromLong", "ObjectHandling.c"))
+                coerce_result = "__Pyx_PyBoolOrNull_FromLong"
+            else:
+                coerce_result = "__Pyx_PyBool_FromLong"
         else:
+            error_clause = code.error_goto_if_neg
+            got_ref = ""
             coerce_result = ""
-        if 'not' in op:
-            negation = "!"
-        else:
-            negation = ""
+
         if self.special_bool_cmp_function:
             if operand1.type.is_pyobject:
                 result1 = operand1.py_result()
@@ -8733,60 +8771,36 @@ class CmpNode(object):
                 result2 = operand2.py_result()
             else:
                 result2 = operand2.result()
-            code.putln("%s = %s(%s, %s, %s); %s" % (
-                result_code,
-                self.special_bool_cmp_function,
-                result1,
-                result2,
-                richcmp_constants[op],
-                code.error_goto_if_neg(result_code, self.pos)))
-        elif op == 'in' or op == 'not_in':
-            code.globalstate.use_utility_code(contains_utility_code)
-            if self.type.is_pyobject:
-                coerce_result = "__Pyx_PyBoolOrNull_FromLong"
-            if op == 'not_in':
-                negation = "__Pyx_NegateNonNeg"
-            if operand2.type is dict_type:
-                method = "PyDict_Contains"
-            else:
-                method = "PySequence_Contains"
-            if self.type.is_pyobject:
-                error_clause = code.error_goto_if_null
-                got_ref = "__Pyx_XGOTREF(%s); " % result_code
-            else:
-                error_clause = code.error_goto_if_neg
-                got_ref = ""
+            if self.special_bool_cmp_utility_code:
+                code.globalstate.use_utility_code(self.special_bool_cmp_utility_code)
             code.putln(
-                "%s = %s(%s(%s(%s, %s))); %s%s" % (
+                "%s = %s(%s(%s, %s, %s)); %s%s" % (
                     result_code,
                     coerce_result,
-                    negation,
-                    method,
-                    operand2.py_result(),
-                    operand1.py_result(),
+                    self.special_bool_cmp_function,
+                    result1, result2, richcmp_constants[op],
                     got_ref,
                     error_clause(result_code, self.pos)))
-        elif (operand1.type.is_pyobject
-            and op not in ('is', 'is_not')):
-                code.putln("%s = PyObject_RichCompare(%s, %s, %s); %s" % (
-                        result_code,
-                        operand1.py_result(),
-                        operand2.py_result(),
-                        richcmp_constants[op],
-                        code.error_goto_if_null(result_code, self.pos)))
-                code.put_gotref(result_code)
+
+        elif operand1.type.is_pyobject and op not in ('is', 'is_not'):
+            assert op not in ('in', 'not_in'), op
+            code.putln("%s = PyObject_RichCompare(%s, %s, %s); %s%s" % (
+                    result_code,
+                    operand1.py_result(),
+                    operand2.py_result(),
+                    richcmp_constants[op],
+                    got_ref,
+                    error_clause(result_code, self.pos)))
+
         elif operand1.type.is_complex:
-            if op == "!=":
-                negation = "!"
-            else:
-                negation = ""
             code.putln("%s = %s(%s%s(%s, %s));" % (
                 result_code,
                 coerce_result,
-                negation,
+                op == "!=" and "!" or "",
                 operand1.type.unary_op('eq'),
                 operand1.result(),
                 operand2.result()))
+
         else:
             type1 = operand1.type
             type2 = operand2.type
@@ -8813,17 +8827,6 @@ class CmpNode(object):
             return "!="
         else:
             return op
-
-contains_utility_code = UtilityCode(
-proto="""
-static CYTHON_INLINE int __Pyx_NegateNonNeg(int b) {
-    return unlikely(b < 0) ? b : !b;
-}
-static CYTHON_INLINE PyObject* __Pyx_PyBoolOrNull_FromLong(long b) {
-    return unlikely(b < 0) ? NULL : __Pyx_PyBool_FromLong(b);
-}
-""")
-
 
 class PrimaryCmpNode(ExprNode, CmpNode):
     #  Non-cascaded comparison or first comparison of
@@ -8892,19 +8895,23 @@ class PrimaryCmpNode(ExprNode, CmpNode):
                     "argument of type 'NoneType' is not iterable")
             elif self.is_ptr_contains():
                 if self.cascade:
-                    error(self.pos, "Cascading comparison not yet supported for 'val in sliced pointer'.")
+                    error(self.pos, "Cascading comparison not supported for 'val in sliced pointer'.")
                 self.type = PyrexTypes.c_bint_type
                 # Will be transformed by IterationTransform
                 return
+            elif self.find_special_bool_compare_function(env, self.operand1):
+                if not self.operand1.type.is_pyobject:
+                    self.operand1 = self.operand1.coerce_to_pyobject(env)
+                common_type = None # if coercion needed, the method call above has already done it
+                self.is_pycmp = False # result is bint
             else:
-                if self.operand2.type is dict_type:
-                    self.operand2 = self.operand2.as_none_safe_node("'NoneType' object is not iterable")
                 common_type = py_object_type
                 self.is_pycmp = True
-        elif self.find_special_bool_compare_function(env):
+        elif self.find_special_bool_compare_function(env, self.operand1):
+            if not self.operand1.type.is_pyobject:
+                self.operand1 = self.operand1.coerce_to_pyobject(env)
             common_type = None # if coercion needed, the method call above has already done it
             self.is_pycmp = False # result is bint
-            self.is_temp = True # must check for error return
         else:
             common_type = self.find_common_type(env, self.operator, self.operand1)
             self.is_pycmp = common_type.is_pyobject
@@ -8915,7 +8922,8 @@ class PrimaryCmpNode(ExprNode, CmpNode):
             self.coerce_operands_to(common_type, env)
 
         if self.cascade:
-            self.operand2 = self.operand2.coerce_to_simple(env)
+            self.operand2 = self.cascade.optimise_comparison(
+                self.operand2.coerce_to_simple(env), env)
             self.cascade.coerce_cascaded_operands_to_temp(env)
         if self.is_python_result():
             self.type = PyrexTypes.py_object_type
@@ -8925,7 +8933,8 @@ class PrimaryCmpNode(ExprNode, CmpNode):
         while cdr:
             cdr.type = self.type
             cdr = cdr.cascade
-        if self.is_pycmp or self.cascade:
+        if self.is_pycmp or self.cascade or self.special_bool_cmp_function:
+            # 1) owned reference, 2) reused value, 3) potential function error return value
             self.is_temp = 1
 
     def analyse_cpp_comparison(self, env):
@@ -9078,6 +9087,14 @@ class CascadedCmpNode(Node, CmpNode):
 
     def has_python_operands(self):
         return self.operand2.type.is_pyobject
+
+    def optimise_comparison(self, operand1, env):
+        if self.find_special_bool_compare_function(env, operand1):
+            if not operand1.type.is_pyobject:
+                operand1 = operand1.coerce_to_pyobject(env)
+        if self.cascade:
+            self.operand2 = self.cascade.optimise_comparison(self.operand2, env)
+        return operand1
 
     def coerce_operands_to_pyobjects(self, env):
         self.operand2 = self.operand2.coerce_to_pyobject(env)
