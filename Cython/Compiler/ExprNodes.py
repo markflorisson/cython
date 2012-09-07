@@ -1500,8 +1500,6 @@ class NameNode(AtomicExprNode):
             if entry.type.is_buffer:
                 import Buffer
                 Buffer.used_buffer_aux_vars(entry)
-            if entry.utility_code:
-                env.use_utility_code(entry.utility_code)
         self.analyse_rvalue_entry(env)
 
     def analyse_target_types(self, env):
@@ -1670,17 +1668,15 @@ class NameNode(AtomicExprNode):
                         self.result(),
                         namespace,
                         interned_cname))
-            if self.cf_maybe_null:
-                if not self.cf_is_null:
-                    code.putln('if (unlikely(!%s)) {' % self.result())
-                    code.putln('PyErr_Clear();')
-                code.putln(
-                    '%s = __Pyx_GetName(%s, %s);' % (
+                code.putln('if (unlikely(!%s)) {' % self.result())
+                code.putln('PyErr_Clear();')
+            code.putln(
+                '%s = __Pyx_GetName(%s, %s);' % (
                     self.result(),
                     Naming.module_cname,
                     interned_cname))
-                if not self.cf_is_null:
-                    code.putln("}");
+            if not self.cf_is_null:
+                code.putln("}");
             code.putln(code.error_goto_if_null(self.result(), self.pos))
             code.put_gotref(self.py_result())
 
@@ -2132,17 +2128,20 @@ class IteratorNode(ExprNode):
             inc_dec = '++'
         code.putln("#if CYTHON_COMPILING_IN_CPYTHON")
         code.putln(
-            "%s = Py%s_GET_ITEM(%s, %s); __Pyx_INCREF(%s); %s%s;" % (
+            "%s = Py%s_GET_ITEM(%s, %s); __Pyx_INCREF(%s); %s%s; %s" % (
                 result_name,
                 test_name,
                 self.py_result(),
                 self.counter_cname,
                 result_name,
                 self.counter_cname,
-                inc_dec))
+                inc_dec,
+                # use the error label to avoid C compiler warnings if we only use it below
+                code.error_goto_if_neg('0', self.pos)
+                ))
         code.putln("#else")
         code.putln(
-            "%s = PySequence_ITEM(%s, %s); %s%s; %s;" % (
+            "%s = PySequence_ITEM(%s, %s); %s%s; %s" % (
                 result_name,
                 self.py_result(),
                 self.counter_cname,
@@ -3548,7 +3547,7 @@ class SliceIndexNode(ExprNode):
             check = stop
         if check:
             code.putln("if (unlikely((%s) != %d)) {" % (check, target_size))
-            code.putln('PyErr_Format(PyExc_ValueError, "Assignment to slice of wrong length, expected %%" PY_FORMAT_SIZE_T "d, got %%" PY_FORMAT_SIZE_T "d", (Py_ssize_t)%d, (Py_ssize_t)(%s));' % (
+            code.putln('PyErr_Format(PyExc_ValueError, "Assignment to slice of wrong length, expected %%" CYTHON_FORMAT_SSIZE_T "d, got %%" CYTHON_FORMAT_SSIZE_T "d", (Py_ssize_t)%d, (Py_ssize_t)(%s));' % (
                         target_size, check))
             code.putln(code.error_goto(self.pos))
             code.putln("}")
@@ -4447,7 +4446,6 @@ class AttributeNode(ExprNode):
                 # builtin types cannot be inferred as C functions as
                 # that would prevent their use as bound methods
                 self.type = py_object_type
-                return py_object_type
             return self.type
 
     def analyse_target_declaration(self, env):
@@ -4573,6 +4571,7 @@ class AttributeNode(ExprNode):
 
     def analyse_attribute(self, env, obj_type = None):
         # Look up attribute and set self.type and self.member.
+        immutable_obj = obj_type is not None # used during type inference
         self.is_py_attr = 0
         self.member = self.attribute
         if obj_type is None:
@@ -4634,9 +4633,9 @@ class AttributeNode(ExprNode):
         # type, or it is an extension type and the attribute is either not
         # declared or is declared as a Python method. Treat it as a Python
         # attribute reference.
-        self.analyse_as_python_attribute(env, obj_type)
+        self.analyse_as_python_attribute(env, obj_type, immutable_obj)
 
-    def analyse_as_python_attribute(self, env, obj_type = None):
+    def analyse_as_python_attribute(self, env, obj_type=None, immutable_obj=False):
         if obj_type is None:
             obj_type = self.obj.type
         # mangle private '__*' Python attributes used inside of a class
@@ -4646,7 +4645,14 @@ class AttributeNode(ExprNode):
         self.is_py_attr = 1
         if not obj_type.is_pyobject and not obj_type.is_error:
             if obj_type.can_coerce_to_pyobject(env):
-                self.obj = self.obj.coerce_to_pyobject(env)
+                if not immutable_obj:
+                    self.obj = self.obj.coerce_to_pyobject(env)
+            elif (obj_type.is_cfunction and self.obj.is_name
+                  and self.obj.entry.as_variable
+                  and self.obj.entry.as_variable.type.is_pyobject):
+                # might be an optimised builtin function => unpack it
+                if not immutable_obj:
+                    self.obj = self.obj.coerce_to_pyobject(env)
             else:
                 error(self.pos,
                       "Object of type '%s' has no attribute '%s'" %
@@ -7285,8 +7291,8 @@ def unop_node(pos, operator, operand):
     # given operator.
     if isinstance(operand, IntNode) and operator == '-':
         return IntNode(pos = operand.pos, value = str(-Utils.str_to_number(operand.value)))
-    elif isinstance(operand, UnopNode) and operand.operator == operator:
-        warning(pos, "Python has no increment/decrement operator: %s%sx = %s(%sx) = x" % ((operator,)*4), 5)
+    elif isinstance(operand, UnopNode) and operand.operator == operator in '+-':
+        warning(pos, "Python has no increment/decrement operator: %s%sx == %s(%sx) == x" % ((operator,)*4), 5)
     return unop_node_classes[operator](pos,
         operator = operator,
         operand = operand)
@@ -8740,7 +8746,9 @@ class CmpNode(object):
                 self.special_bool_cmp_utility_code = UtilityCode.load_cached("PyDictContains", "ObjectHandling.c")
                 self.special_bool_cmp_function = "__Pyx_PyDict_Contains"
                 return True
-            elif self.operand2.type.is_pyobject:
+            else:
+                if not self.operand2.type.is_pyobject:
+                    self.operand2 = self.operand2.coerce_to_pyobject(env)
                 self.special_bool_cmp_utility_code = UtilityCode.load_cached("PySequenceContains", "ObjectHandling.c")
                 self.special_bool_cmp_function = "__Pyx_PySequence_Contains"
                 return True

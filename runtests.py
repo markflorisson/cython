@@ -16,6 +16,14 @@ import traceback
 import warnings
 
 try:
+    import platform
+    IS_PYPY = platform.python_implementation() == 'PyPy'
+    IS_CPYTHON = platform.python_implementation() == 'CPython'
+except (ImportError, AttributeError):
+    IS_CPYTHON = True
+    IS_PYPY = False
+
+try:
     from StringIO import StringIO
 except ImportError:
     from io import StringIO
@@ -116,7 +124,9 @@ def get_openmp_compiler_flags(language):
         cc = sysconfig.get_config_var('CC')
 
     if not cc:
-        return None # Windows?
+        if sys.platform == 'win32':
+            return '/openmp', ''
+        return None
 
     # For some reason, cc can be e.g. 'gcc -pthread'
     cc = cc.split()[0]
@@ -740,14 +750,14 @@ class CythonRunTestCase(CythonCompileTestCase):
             tests.run(result)
         run_forked_test(result, run_test, self.shortDescription(), self.fork)
 
-
 def run_forked_test(result, run_func, test_name, fork=True):
     if not fork or sys.version_info[0] >= 3 or not hasattr(os, 'fork'):
         run_func(result)
+        sys.stdout.flush()
+        sys.stderr.flush()
         gc.collect()
         return
 
-    module_name = test_name.split()[-1]
     # fork to make sure we do not keep the tested module loaded
     result_handle, result_file = tempfile.mkstemp()
     os.close(result_handle)
@@ -760,6 +770,8 @@ def run_forked_test(result, run_func, test_name, fork=True):
                 try:
                     partial_result = PartialTestResult(result)
                     run_func(partial_result)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                     gc.collect()
                 except Exception:
                     if tests is None:
@@ -788,7 +800,7 @@ def run_forked_test(result, run_func, test_name, fork=True):
         if result_code & 255:
             raise Exception("Tests in module '%s' were unexpectedly killed by signal %d"%
                             (module_name, result_code & 255))
-        result_code = result_code >> 8
+        result_code >>= 8
         if result_code in (0,1):
             input = open(result_file, 'rb')
             try:
@@ -902,7 +914,9 @@ class CythonPyregrTestCase(CythonRunTestCase):
         CythonRunTestCase.setUp(self)
         from Cython.Compiler import Options
         Options.error_on_unknown_names = False
-        Options.directive_defaults.update(dict(binding=True, always_allow_keywords=True))
+        Options.directive_defaults.update(dict(
+            binding=True, always_allow_keywords=True,
+            set_initial_path="SOURCEFILE"))
 
     def _run_unittest(self, result, *classes):
         """Run tests from unittest.TestCase-derived classes."""
@@ -935,19 +949,26 @@ class CythonPyregrTestCase(CythonRunTestCase):
             def run_doctest(module, verbosity=None):
                 return self._run_doctest(result, module)
 
+            backup = (support.run_unittest, support.run_doctest)
             support.run_unittest = run_unittest
             support.run_doctest = run_doctest
 
             try:
-                module = __import__(self.module)
-                if hasattr(module, 'test_main'):
-                    module.test_main()
-            except (unittest.SkipTest, support.ResourceDenied):
-                result.addSkip(self, 'ok')
+                try:
+                    sys.stdout.flush() # helps in case of crashes
+                    module = __import__(self.module)
+                    sys.stdout.flush() # helps in case of crashes
+                    if hasattr(module, 'test_main'):
+                        module.test_main()
+                        sys.stdout.flush() # helps in case of crashes
+                except (unittest.SkipTest, support.ResourceDenied):
+                    result.addSkip(self, 'ok')
+            finally:
+                support.run_unittest, support.run_doctest = backup
 
         run_forked_test(result, run_test, self.shortDescription(), self.fork)
 
-include_debugger = sys.version_info[:2] > (2, 5)
+include_debugger = IS_CPYTHON and sys.version_info[:2] > (2, 5)
 
 def collect_unittests(path, module_prefix, suite, selectors, exclude_selectors):
     def file_matches(filename):
@@ -1045,14 +1066,14 @@ class EndToEndTest(unittest.TestCase):
         self.treefile = treefile
         self.workdir = os.path.join(workdir, self.name)
         self.cleanup_workdir = cleanup_workdir
-        cython_syspath = self.cython_root
-        for path in sys.path[::-1]:
-            if path.startswith(self.cython_root):
+        cython_syspath = [self.cython_root]
+        for path in sys.path:
+            if path.startswith(self.cython_root) and path not in cython_syspath:
                 # Py3 installation and refnanny build prepend their
                 # fixed paths to sys.path => prefer that over the
-                # generic one
-                cython_syspath = path + os.pathsep + cython_syspath
-        self.cython_syspath = cython_syspath
+                # generic one (cython_root itself goes last)
+                cython_syspath.append(path)
+        self.cython_syspath = os.pathsep.join(cython_syspath[::-1])
         unittest.TestCase.__init__(self)
 
     def shortDescription(self):
@@ -1088,9 +1109,9 @@ class EndToEndTest(unittest.TestCase):
         commands = (self.commands
             .replace("CYTHON", "PYTHON %s" % os.path.join(self.cython_root, 'cython.py'))
             .replace("PYTHON", sys.executable))
+        old_path = os.environ.get('PYTHONPATH')
+        os.environ['PYTHONPATH'] = self.cython_syspath + os.pathsep + (old_path or '')
         try:
-            old_path = os.environ.get('PYTHONPATH')
-            os.environ['PYTHONPATH'] = self.cython_syspath + os.pathsep + os.path.join(self.cython_syspath, (old_path or ''))
             for command in commands.split('\n'):
                 p = subprocess.Popen(commands,
                                      stderr=subprocess.PIPE,

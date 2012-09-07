@@ -269,7 +269,7 @@ class UtilityCodeBase(object):
         """
         util = cls.load(util_code_name, from_file, **kwargs)
         proto, impl = util.proto, util.impl
-        return proto and proto.lstrip(), impl and impl.lstrip()
+        return util.format_code(proto), util.format_code(impl)
 
     def format_code(self, code_string, replace_empty_lines=re.compile(r'\n\n+').sub):
         """

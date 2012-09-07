@@ -1199,7 +1199,8 @@ class CppClassNode(CStructOrUnionDefNode, BlockNode):
         if self.entry is None:
             return
         self.entry.is_cpp_class = 1
-        scope.type = self.entry.type
+        if scope is not None:
+            scope.type = self.entry.type
         defined_funcs = []
         if self.attributes is not None:
             if self.in_pxd and not env.in_cinclude:
@@ -3792,7 +3793,7 @@ class PyClassDefNode(ClassDefNode):
     #  target   NameNode   Variable to assign class object to
 
     child_attrs = ["body", "dict", "metaclass", "mkw", "bases", "class_result",
-                   "target", "class_cell"]
+                   "target", "class_cell", "decorators"]
     decorators = None
     class_result = None
     py3_style_class = False # Python3 style class (bases+kwargs)
@@ -3909,6 +3910,7 @@ class PyClassDefNode(ClassDefNode):
                     decorator.pos,
                     function = decorator.decorator,
                     args = [class_result])
+            self.decorators = None
         self.class_result = class_result
         self.class_result.analyse_declarations(env)
         self.target.analyse_target_declaration(env)
@@ -4683,7 +4685,7 @@ class ExecStatNode(StatNode):
             args.append( arg.py_result() )
         args = tuple(args + ['0', '0'][:3-len(args)])
         temp_result = code.funcstate.allocate_temp(PyrexTypes.py_object_type, manage_ref=True)
-        code.putln("%s = __Pyx_PyRun(%s, %s, %s);" % (
+        code.putln("%s = __Pyx_PyExec3(%s, %s, %s);" % (
                 (temp_result,) + args))
         for arg in self.args:
             arg.generate_disposal_code(code)
@@ -5004,7 +5006,7 @@ class ReraiseStatNode(StatNode):
     is_terminator = True
 
     def analyse_expressions(self, env):
-        env.use_utility_code(restore_exception_utility_code)
+        pass
 
     nogil_check = Node.gil_error
     gil_message = "Raising exception"
@@ -5012,6 +5014,7 @@ class ReraiseStatNode(StatNode):
     def generate_execution_code(self, code):
         vars = code.funcstate.exc_vars
         if vars:
+            code.globalstate.use_utility_code(restore_exception_utility_code)
             for varname in vars:
                 code.put_giveref(varname)
             code.putln("__Pyx_ErrRestore(%s, %s, %s);" % tuple(vars))
@@ -5020,8 +5023,9 @@ class ReraiseStatNode(StatNode):
             code.putln()
             code.putln(code.error_goto(self.pos))
         else:
-            error(self.pos, "Reraise not inside except clause")
-
+            code.globalstate.use_utility_code(
+                UtilityCode.load_cached("ReRaiseException", "Exceptions.c"))
+            code.putln("__Pyx_ReraiseException(); %s" % code.error_goto(self.pos))
 
 class AssertStatNode(StatNode):
     #  assert statement
@@ -7623,7 +7627,6 @@ class ParallelRangeNode(ParallelStatNode):
         # target index uninitialized
         code.putln("if (%(nsteps)s > 0)" % fmt_dict)
         code.begin_block() # if block
-        code.putln("%(target)s = 0;" % fmt_dict)
         self.generate_loop(code, fmt_dict)
         code.end_block() # end if block
 
