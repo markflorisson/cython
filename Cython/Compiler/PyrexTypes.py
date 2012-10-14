@@ -1436,6 +1436,9 @@ class CNumericType(CType):
         return (isinstance(other, CNumericType) and
                 self.rank == other.rank and self.signed == other.signed)
 
+    def __hash__(self):
+        return hash(self.sign_and_name())
+
     def py_type_name(self):
         if self.rank <= 4:
             return "(int, long)"
