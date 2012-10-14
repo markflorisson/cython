@@ -268,7 +268,6 @@ packages = [
     'Cython.Distutils',
     'Cython.Plex',
     'Cython.minivect',
-    'Cython.minivect.tests',
     'Cython.minivect.pydot',
     'Cython.Tests',
     'Cython.Build.Tests',

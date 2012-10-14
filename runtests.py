@@ -1647,6 +1647,9 @@ def runtests(options, cmd_args, coverage=None):
     if sys.platform in ['win32', 'cygwin'] and sys.version_info < (2,6):
         exclude_selectors += [ lambda x: x == "run.specialfloat" ]
 
+    exclude_selectors.append(
+            lambda filename, *args: filename.startswith("Cython.minivect"))
+
     global COMPILER
     if options.compiler:
         COMPILER = options.compiler
