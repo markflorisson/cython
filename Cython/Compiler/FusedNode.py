@@ -6,6 +6,7 @@ from Cython.Compiler import (ExprNodes, PyrexTypes, MemoryView,
 from Cython.Compiler.ExprNodes import CloneNode, ProxyNode, TupleNode
 from Cython.Compiler.Nodes import (FuncDefNode, CFuncDefNode, StatListNode,
                                    DefNode)
+from PyrexTypes import py_object_type
 
 class FusedCFuncDefNode(StatListNode):
     """
@@ -769,6 +770,7 @@ class FusedCFuncDefNode(StatListNode):
                                     (self.resulting_fused_function.result(),
                                      self.__signatures__.result()))
             code.put_giveref(self.__signatures__.result())
+            self.__signatures__.generate_post_assignment_code(code)
 
             self.fused_func_assignment.generate_execution_code(code)
 
