@@ -23,10 +23,12 @@ def test_overlapping_memory(fused_dtype_t[:] m1, fused_dtype_t[:, :] m2):
 @testcase
 def test_allocate_new_memory_simple(fused_dtype_t[:] m):
     """
-    >>> test_allocate_new_memory_simple(np.arange(10, dtype=np.longdouble))
-    array([ 0.0,  2.0,  4.0,  6.0,  8.0,  10.0,  12.0,  14.0,  16.0,  18.0], dtype=float128)
-    >>> test_allocate_new_memory_simple(object_range(10))
-    array([0, 2, 4, 6, 8, 10, 12, 14, 16, 18], dtype=object)
+    >>> m = np.arange(10, dtype=np.longdouble)
+    >>> np.all(test_allocate_new_memory_simple(m) == m + m)
+    True
+    >>> m = object_range(10)
+    >>> np.all(test_allocate_new_memory_simple(m) == m + m)
+    True
     """
     result = m + m
     return np.asarray(result)

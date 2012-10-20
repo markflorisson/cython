@@ -67,8 +67,9 @@ def test_simple_binop_assign_contig_2d(int[:, :] m):
 @testcase
 def test_typedef(np.int32_t[:] m):
     """
-    >>> np.asarray(test_typedef(np.arange(10, dtype=np.int32)))
-    array([ 0,  3,  6,  9, 12, 15, 18, 21, 24, 27], dtype=int32)
+    >>> m = np.arange(10, dtype=np.int32)
+    >>> np.all(np.asarray(test_typedef(np.arange(10, dtype=np.int32))) == m * 3)
+    True
     """
     m[:] = m + m + m
     return m
@@ -83,8 +84,9 @@ def test_arbitrary_dtypes(fused_dtype_t[:] m1, fused_dtype_t[::1] m2):
     >>> test_arbitrary_dtypes(*operands('l'))
     array([ 0,  3,  6,  9, 12, 15, 18, 21, 24, 27])
 
-    >>> test_arbitrary_dtypes(*operands(dtype=np.longdouble))
-    array([ 0.0,  3.0,  6.0,  9.0,  12.0,  15.0,  18.0,  21.0,  24.0,  27.0], dtype=float128)
+    >>> m1, m2 = operands(dtype=np.longdouble)
+    >>> np.all(test_arbitrary_dtypes(*operands(dtype=np.longdouble)) == m1 * 3)
+    True
 
     >>> ops = operands(np.complex128)
     >>> test_arbitrary_dtypes(ops[0] + 1.2j, ops[1] + 1.2j)
@@ -164,11 +166,10 @@ def test_evaluate_operands_once(int[:] m):
 @testcase
 def test_unop_simple(fused_dtype_t[:] m):
     """
-    >>> test_unop_simple(np.arange(10, dtype=np.longdouble))
-    array([-2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0], dtype=float128)
-    >>> test_unop_simple(np.arange(10, dtype=np.complex128))
-    array([-2.+0.j, -2.+0.j, -2.+0.j, -2.+0.j, -2.+0.j, -2.+0.j, -2.+0.j,
-           -2.+0.j, -2.+0.j, -2.+0.j])
+    >>> np.all(test_unop_simple(np.arange(10, dtype=np.longdouble)) == -2)
+    True
+    >>> np.all(test_unop_simple(np.arange(10, dtype=np.complex128)) == -2+0j)
+    True
     """
     m[:] = -m --m - 2
     return np.asarray(m)

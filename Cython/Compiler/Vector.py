@@ -36,7 +36,15 @@ graphviz_out_filename = os.path.expanduser("~/ast%s.dot")
 write_graphviz = False
 
 # Macro that should be defined to enable explicit vectorization
+# -DCYTHON_VECTOR_SIZE=4 enables SSE
+# -DCYTHON_VECTOR_SIZE=4 enables AVX
 cython_vector_size = "CYTHON_VECTOR_SIZE"
+
+try:
+    from builtins import next # Py3k
+except ImportError:
+    def next(it):
+        return it.next()
 
 class TypeMapper(minitypes.TypeMapper):
     """
@@ -793,7 +801,7 @@ class SpecializationCaller(ExprNodes.ExprNode):
 
         codes = self.context.run(self.function, [specializer],
                                  graphviz_outfile=graphviz_outfile)
-        specializer, ast, codewriter, (proto, impl) = iter(codes).next()
+        specializer, ast, codewriter, (proto, impl) = next(iter(codes))
 
         if guard is not None:
             proto = "%s\n%s\n#endif\n" % (guard, proto)
@@ -1557,7 +1565,7 @@ class ElementalMapper(specializers.ASTMapper):
 
         arg_types = [arg.type for arg in miniargs]
         func_type = minitypes.FunctionType(return_type=minitype,
-                                           arg_types=arg_types)
+                                           args=arg_types)
         minifunc = b.funcname(func_type, node.function.entry.cname)
         return b.funccall(minifunc, miniargs)
 
