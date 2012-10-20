@@ -200,9 +200,11 @@ i_a = np.arange(4*5*6, dtype=np.int32).reshape(4, 5, 6)
 i_b = np.arange(4*5*1, dtype=np.int32).reshape(4, 5, 1)
 
 def equal(our_result, numpy_result):
-    our_result = np.asarray(our_result).astype(int)
-    numpy_result = numpy_result.astype(int)
-    if not np.all(our_result == numpy_result):
+    our_result = np.asarray(our_result)
+    if our_result.dtype.kind == 'O':
+        our_result = our_result.astype(np.int32)
+        numpy_result = numpy_result.astype(np.int32)
+    if not np.allclose(our_result, numpy_result):
         print our_result
         print
         print 'Expected'
