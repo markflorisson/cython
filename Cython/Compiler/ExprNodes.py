@@ -397,7 +397,7 @@ class ExprNode(Node):
     def nonlocally_immutable(self):
         # Returns whether this variable is a safe reference, i.e.
         # can't be modified as part of globals or closures.
-        return self.is_temp or self.type.is_array or self.type.is_cfunction
+        return self.is_literal or self.is_temp or self.type.is_array or self.type.is_cfunction
 
     # --------------- Type Analysis ------------------
 
@@ -1631,7 +1631,9 @@ class NameNode(AtomicExprNode):
         if ExprNode.nonlocally_immutable(self):
             return True
         entry = self.entry
-        return entry and (entry.is_local or entry.is_arg) and not entry.in_closure
+        if not entry or entry.in_closure:
+            return False
+        return entry.is_local or entry.is_arg or entry.is_builtin or entry.is_readonly
 
     def calculate_target_results(self, env):
         pass
@@ -5401,6 +5403,7 @@ class SequenceNode(ExprNode):
                 code.putln("%s = PySequence_ITEM(sequence, %d); %s" % (
                     item.result(), i,
                     code.error_goto_if_null(item.result(), self.pos)))
+                code.put_gotref(item.result())
         else:
             code.putln("Py_ssize_t i;")
             code.putln("PyObject** temps[%s] = {%s};" % (
@@ -5409,6 +5412,7 @@ class SequenceNode(ExprNode):
             code.putln("for (i=0; i < %s; i++) {" % len(self.unpacked_items))
             code.putln("PyObject* item = PySequence_ITEM(sequence, i); %s" % (
                 code.error_goto_if_null('item', self.pos)))
+            code.put_gotref('item')
             code.putln("*(temps[i]) = item;")
             code.putln("}")
 
@@ -7648,7 +7652,7 @@ class TypecastNode(ExprNode):
         return self.operand.is_simple()
 
     def nonlocally_immutable(self):
-        return self.operand.nonlocally_immutable()
+        return self.is_temp or self.operand.nonlocally_immutable()
 
     def nogil_check(self, env):
         if self.type and self.type.is_pyobject and self.is_temp:
@@ -9639,6 +9643,9 @@ class PyTypeTestNode(CoercionNode):
     def is_ephemeral(self):
         return self.arg.is_ephemeral()
 
+    def nonlocally_immutable(self):
+        return self.arg.nonlocally_immutable()
+
     def calculate_constant_result(self):
         # FIXME
         pass
@@ -9694,6 +9701,9 @@ class NoneCheckNode(CoercionNode):
 
     def result_in_temp(self):
         return self.arg.result_in_temp()
+
+    def nonlocally_immutable(self):
+        return self.arg.nonlocally_immutable()
 
     def calculate_result_code(self):
         return self.arg.result()
