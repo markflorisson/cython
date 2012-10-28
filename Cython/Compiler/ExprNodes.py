@@ -10113,12 +10113,19 @@ class CloneNode(CoercionNode):
     def analyse_types(self, env):
         self.type = self.arg.type
         self.result_ctype = self.arg.result_ctype
-        self.is_temp = 1
         if hasattr(self.arg, 'entry'):
             self.entry = self.arg.entry
 
-    def result_in_temp(self):
-        return True
+        # Setting is_temp to True means we also have to override
+        # make_owned_reference, since temporaries are assumed owned and
+        # we may not actually own it
+        self.is_temp = 1
+
+    def make_owned_reference(self, code):
+        self.arg.make_owned_reference(code)
+
+    def make_owned_memoryviewslice(self, code):
+        return self.arg.make_owned_memoryviewslice(code)
 
     def is_simple(self):
         return True # result is always in a temp (or a name)
