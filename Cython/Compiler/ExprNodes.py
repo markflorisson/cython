@@ -3218,9 +3218,7 @@ class BufferIndexNode(ExprNode):
             rhs_code = rhs.result()
             code.putln("%s = %s;" % (ptr, ptrexpr))
             code.put_gotref("*%s" % ptr)
-            code.putln("__Pyx_INCREF(%s); __Pyx_DECREF(*%s);" % (
-                ptr, rhs_code
-                ))
+            code.putln("__Pyx_INCREF(%s); __Pyx_DECREF(*%s);" % (rhs_code, ptr))
             code.putln("*%s %s= %s;" % (ptr, op, rhs_code))
             code.put_giveref("*%s" % ptr)
             code.funcstate.release_temp(ptr)
@@ -4082,7 +4080,8 @@ class SimpleCallNode(CallNode):
             formal_type = func_type.args[i].type
             arg = self.args[i]
             if (arg.type.is_memoryviewslice and not
-                    formal_type.is_memoryviewslice and
+                    formal_type.is_memoryviewslice and not
+                    formal_type.is_pyobject and
                     formal_type.assignable_from(arg.type.dtype)):
                 # elemental function call, this node will be replaced later
                 self.is_elemental = True
