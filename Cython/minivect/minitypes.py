@@ -304,6 +304,39 @@ INT_KIND = 1
 FLOAT_KIND = 2
 COMPLEX_KIND = 3
 
+def index_type(base_type, item):
+    """
+    Support array type creation by slicing, e.g. double[:, :] specifies
+    a 2D strided array of doubles. The syntax is the same as for
+    Cython memoryviews.
+    """
+    assert isinstance(item, (tuple, slice))
+
+    def verify_slice(s):
+        if s.start or s.stop or s.step not in (None, 1):
+            raise minierror.InvalidTypeSpecification(
+                "Only a step of 1 may be provided to indicate C or "
+                "Fortran contiguity")
+
+    if isinstance(item, tuple):
+        step_idx = None
+        for idx, s in enumerate(item):
+            verify_slice(s)
+            if s.step and (step_idx or idx not in (0, len(item) - 1)):
+                raise minierror.InvalidTypeSpecification(
+                    "Step may only be provided once, and only in the "
+                    "first or last dimension.")
+
+            if s.step == 1:
+                step_idx = idx
+
+        return ArrayType(base_type, len(item),
+                         is_c_contig=step_idx == len(item) - 1,
+                         is_f_contig=step_idx == 0)
+    else:
+        verify_slice(item)
+        return ArrayType(base_type, 1, is_c_contig=bool(item.step))
+
 class Type(miniutils.ComparableObjectMixin):
     """
     Base class for all types.
@@ -383,38 +416,7 @@ class Type(miniutils.ComparableObjectMixin):
 
         return h
 
-    def __getitem__(self, item):
-        """
-        Support array type creation by slicing, e.g. double[:, :] specifies
-        a 2D strided array of doubles. The syntax is the same as for
-        Cython memoryviews.
-        """
-        assert isinstance(item, (tuple, slice))
-
-        def verify_slice(s):
-            if s.start or s.stop or s.step not in (None, 1):
-                raise minierror.InvalidTypeSpecification(
-                    "Only a step of 1 may be provided to indicate C or "
-                    "Fortran contiguity")
-
-        if isinstance(item, tuple):
-            step_idx = None
-            for idx, s in enumerate(item):
-                verify_slice(s)
-                if s.step and (step_idx or idx not in (0, len(item) - 1)):
-                    raise minierror.InvalidTypeSpecification(
-                        "Step may only be provided once, and only in the "
-                        "first or last dimension.")
-
-                if s.step == 1:
-                    step_idx = idx
-
-            return ArrayType(self, len(item),
-                             is_c_contig=step_idx == len(item) - 1,
-                             is_f_contig=step_idx == 0)
-        else:
-            verify_slice(item)
-            return ArrayType(self, 1, is_c_contig=bool(item.step))
+    __getitem__ = index_type
 
     def declare(self):
         return str(self)
