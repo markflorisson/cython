@@ -1962,7 +1962,7 @@ class ImportNode(ExprNode):
             self.name_list.analyse_types(env)
             self.name_list.coerce_to_pyobject(env)
         self.is_temp = 1
-        env.use_utility_code(import_utility_code)
+        env.use_utility_code(UtilityCode.load_cached("Import", "ImportExport.c"))
 
     gil_message = "Python import"
 
@@ -5222,68 +5222,78 @@ class SequenceNode(ExprNode):
     def generate_sequence_packing_code(self, code, target=None, plain=False):
         if target is None:
             target = self.result()
-        py_multiply = self.mult_factor and not self.mult_factor.type.is_int
-        if plain or py_multiply:
-            mult_factor = None
-        else:
+        size_factor = c_mult = ''
+        mult_factor = None
+
+        if self.mult_factor and not plain:
             mult_factor = self.mult_factor
-        if mult_factor:
-            mult = mult_factor.result()
-            if isinstance(mult_factor.constant_result, (int,long)) \
-                   and mult_factor.constant_result > 0:
-                size_factor = ' * %s' % mult_factor.constant_result
-            else:
-                size_factor = ' * ((%s<0) ? 0:%s)' % (mult, mult)
-        else:
-            size_factor = ''
-            mult = ''
+            if mult_factor.type.is_int:
+                c_mult = mult_factor.result()
+                if isinstance(mult_factor.constant_result, (int,long)) \
+                       and mult_factor.constant_result > 0:
+                    size_factor = ' * %s' % mult_factor.constant_result
+                else:
+                    size_factor = ' * ((%s<0) ? 0:%s)' % (c_mult, c_mult)
 
-        if self.type is Builtin.list_type:
-            create_func, set_item_func = 'PyList_New', 'PyList_SET_ITEM'
-        elif self.type is Builtin.tuple_type:
-            create_func, set_item_func = 'PyTuple_New', 'PyTuple_SET_ITEM'
-        else:
-            raise InternalError("sequence packing for unexpected type %s" % self.type)
-        arg_count = len(self.args)
-        code.putln("%s = %s(%s%s); %s" % (
-            target, create_func, arg_count, size_factor,
-            code.error_goto_if_null(target, self.pos)))
-        code.put_gotref(target)
-
-        if mult:
-            # FIXME: can't use a temp variable here as the code may
-            # end up in the constant building function.  Temps
-            # currently don't work there.
-
-            #counter = code.funcstate.allocate_temp(mult_factor.type, manage_ref=False)
-            counter = Naming.quick_temp_cname
-            code.putln('{ Py_ssize_t %s;' % counter)
-            if arg_count == 1:
-                offset = counter
-            else:
-                offset = '%s * %s' % (counter, arg_count)
-            code.putln('for (%s=0; %s < %s; %s++) {' % (
-                counter, counter, mult, counter
-                ))
-        else:
-            offset = ''
-        for i in xrange(arg_count):
-            arg = self.args[i]
-            if mult or not arg.result_in_temp():
-                code.put_incref(arg.result(), arg.ctype())
-            code.putln("%s(%s, %s, %s);" % (
-                set_item_func,
+        if self.type is Builtin.tuple_type and self.is_literal and not c_mult:
+            # use PyTuple_Pack() to avoid generating huge amounts of one-time code
+            code.putln('%s = PyTuple_Pack(%d, %s); %s' % (
                 target,
-                (offset and i) and ('%s + %s' % (offset, i)) or (offset or i),
-                arg.py_result()))
-            code.put_giveref(arg.py_result())
-        if mult:
-            code.putln('}')
-            #code.funcstate.release_temp(counter)
-            code.putln('}')
-        elif py_multiply and not plain:
+                len(self.args),
+                ', '.join([ arg.py_result() for arg in self.args ]),
+                code.error_goto_if_null(target, self.pos)))
+            code.put_gotref(target)
+        else:
+            # build the tuple/list step by step, potentially multiplying it as we go
+            if self.type is Builtin.list_type:
+                create_func, set_item_func = 'PyList_New', 'PyList_SET_ITEM'
+            elif self.type is Builtin.tuple_type:
+                create_func, set_item_func = 'PyTuple_New', 'PyTuple_SET_ITEM'
+            else:
+                raise InternalError("sequence packing for unexpected type %s" % self.type)
+            arg_count = len(self.args)
+            code.putln("%s = %s(%s%s); %s" % (
+                target, create_func, arg_count, size_factor,
+                code.error_goto_if_null(target, self.pos)))
+            code.put_gotref(target)
+
+            if c_mult:
+                # FIXME: can't use a temp variable here as the code may
+                # end up in the constant building function.  Temps
+                # currently don't work there.
+
+                #counter = code.funcstate.allocate_temp(mult_factor.type, manage_ref=False)
+                counter = Naming.quick_temp_cname
+                code.putln('{ Py_ssize_t %s;' % counter)
+                if arg_count == 1:
+                    offset = counter
+                else:
+                    offset = '%s * %s' % (counter, arg_count)
+                code.putln('for (%s=0; %s < %s; %s++) {' % (
+                    counter, counter, c_mult, counter
+                    ))
+            else:
+                offset = ''
+
+            for i in xrange(arg_count):
+                arg = self.args[i]
+                if c_mult or not arg.result_in_temp():
+                    code.put_incref(arg.result(), arg.ctype())
+                code.putln("%s(%s, %s, %s);" % (
+                    set_item_func,
+                    target,
+                    (offset and i) and ('%s + %s' % (offset, i)) or (offset or i),
+                    arg.py_result()))
+                code.put_giveref(arg.py_result())
+
+            if c_mult:
+                code.putln('}')
+                #code.funcstate.release_temp(counter)
+                code.putln('}')
+
+        if mult_factor is not None and mult_factor.type.is_pyobject:
             code.putln('{ PyObject* %s = PyNumber_InPlaceMultiply(%s, %s); %s' % (
-                Naming.quick_temp_cname, target, self.mult_factor.py_result(),
+                Naming.quick_temp_cname, target, mult_factor.py_result(),
                 code.error_goto_if_null(Naming.quick_temp_cname, self.pos)
                 ))
             code.put_gotref(Naming.quick_temp_cname)
@@ -7602,6 +7612,9 @@ class TypecastNode(ExprNode):
         if self.type is None:
             base_type = self.base_type.analyse(env)
             _, self.type = self.declarator.analyse(base_type, env)
+        if self.operand.has_constant_result():
+            # Must be done after self.type is resolved.
+            self.calculate_constant_result()
         if self.type.is_cfunction:
             error(self.pos,
                 "Cannot cast to a function type")
@@ -7661,11 +7674,11 @@ class TypecastNode(ExprNode):
         return self.operand.check_const()
 
     def calculate_constant_result(self):
-        # we usually do not know the result of a type cast at code
-        # generation time
-        pass
+        self.constant_result = self.calculate_result_code(self.operand.constant_result)
 
-    def calculate_result_code(self):
+    def calculate_result_code(self, operand_result = None):
+        if operand_result is None:
+            operand_result = self.operand.result()
         if self.type.is_complex:
             operand_result = self.operand.result()
             if self.operand.type.is_complex:
@@ -7679,7 +7692,7 @@ class TypecastNode(ExprNode):
                     real_part,
                     imag_part)
         else:
-            return self.type.cast_code(self.operand.result())
+            return self.type.cast_code(operand_result)
 
     def get_constant_c_result_code(self):
         operand_result = self.operand.get_constant_c_result_code()
@@ -8344,6 +8357,7 @@ class NumBinopNode(BinopNode):
     #  Binary operation taking numeric arguments.
 
     infix = True
+    overflow_check = False
 
     def analyse_c_operation(self, env):
         type1 = self.operand1.type
@@ -8354,6 +8368,19 @@ class NumBinopNode(BinopNode):
             return
         if self.type.is_complex:
             self.infix = False
+        if (self.type.is_int
+                and env.directives['overflowcheck']
+                and self.operator in self.overflow_op_names):
+            if (self.operator in ('+', '*')
+                    and self.operand1.has_constant_result()
+                    and not self.operand2.has_constant_result()):
+                self.operand1, self.operand2 = self.operand2, self.operand1
+            self.overflow_check = True
+            self.func = self.type.overflow_check_binop(
+                self.overflow_op_names[self.operator],
+                env,
+                const_rhs = self.operand2.has_constant_result())
+            self.is_temp = True
         if not self.infix or (type1.is_numeric and type2.is_numeric):
             self.operand1 = self.operand1.coerce_to(self.type, env)
             self.operand2 = self.operand2.coerce_to(self.type, env)
@@ -8395,8 +8422,26 @@ class NumBinopNode(BinopNode):
         return (type1.is_numeric  or type1.is_enum) \
             and (type2.is_numeric  or type2.is_enum)
 
+    def generate_result_code(self, code):
+        super(NumBinopNode, self).generate_result_code(code)
+        if self.overflow_check:
+            self.overflow_bit = code.funcstate.allocate_temp(PyrexTypes.c_int_type, manage_ref=False)
+            code.putln("%s = 0;" % self.overflow_bit);
+            code.putln("%s = %s;" % (self.result(), self.calculate_result_code()))
+            code.putln("if (unlikely(%s)) {" % self.overflow_bit)
+            code.putln('PyErr_Format(PyExc_OverflowError, "value too large");')
+            code.putln(code.error_goto(self.pos))
+            code.putln("}")
+            code.funcstate.release_temp(self.overflow_bit)
+
     def calculate_result_code(self):
-        if self.infix:
+        if self.overflow_check:
+            return "%s(%s, %s, &%s)" % (
+                self.func,
+                self.operand1.result(),
+                self.operand2.result(),
+                self.overflow_bit)
+        elif self.infix:
             return "(%s %s %s)" % (
                 self.operand1.result(),
                 self.operator,
@@ -8434,6 +8479,13 @@ class NumBinopNode(BinopNode):
         "//":       "PyNumber_FloorDivide",
         "%":        "PyNumber_Remainder",
         "**":       "PyNumber_Power"
+    }
+    
+    overflow_op_names = {
+       "+":  "add",
+       "-":  "sub",
+       "*":  "mul",
+       "<<":  "lshift",
     }
 
 class IntBinopNode(NumBinopNode):
@@ -10222,86 +10274,6 @@ static PyObject *__Pyx_GetName(PyObject *dict, PyObject *name) {
     return result;
 }
 """ % {'BUILTINS' : Naming.builtins_cname})
-
-#------------------------------------------------------------------------------------
-
-import_utility_code = UtilityCode(
-proto = """
-static PyObject *__Pyx_Import(PyObject *name, PyObject *from_list, long level); /*proto*/
-""",
-impl = """
-static PyObject *__Pyx_Import(PyObject *name, PyObject *from_list, long level) {
-    PyObject *py_import = 0;
-    PyObject *empty_list = 0;
-    PyObject *module = 0;
-    PyObject *global_dict = 0;
-    PyObject *empty_dict = 0;
-    PyObject *list;
-    py_import = __Pyx_GetAttrString(%(BUILTINS)s, "__import__");
-    if (!py_import)
-        goto bad;
-    if (from_list)
-        list = from_list;
-    else {
-        empty_list = PyList_New(0);
-        if (!empty_list)
-            goto bad;
-        list = empty_list;
-    }
-    global_dict = PyModule_GetDict(%(GLOBALS)s);
-    if (!global_dict)
-        goto bad;
-    empty_dict = PyDict_New();
-    if (!empty_dict)
-        goto bad;
-    #if PY_VERSION_HEX >= 0x02050000
-    {
-        #if PY_MAJOR_VERSION >= 3
-        if (level == -1) {
-            if (strchr(__Pyx_MODULE_NAME, '.')) {
-                /* try package relative import first */
-                PyObject *py_level = PyInt_FromLong(1);
-                if (!py_level)
-                    goto bad;
-                module = PyObject_CallFunctionObjArgs(py_import,
-                    name, global_dict, empty_dict, list, py_level, NULL);
-                Py_DECREF(py_level);
-                if (!module) {
-                    if (!PyErr_ExceptionMatches(PyExc_ImportError))
-                        goto bad;
-                    PyErr_Clear();
-                }
-            }
-            level = 0; /* try absolute import on failure */
-        }
-        #endif
-        if (!module) {
-            PyObject *py_level = PyInt_FromLong(level);
-            if (!py_level)
-                goto bad;
-            module = PyObject_CallFunctionObjArgs(py_import,
-                name, global_dict, empty_dict, list, py_level, NULL);
-            Py_DECREF(py_level);
-        }
-    }
-    #else
-    if (level>0) {
-        PyErr_SetString(PyExc_RuntimeError, "Relative import is not supported for Python <=2.4.");
-        goto bad;
-    }
-    module = PyObject_CallFunctionObjArgs(py_import,
-        name, global_dict, empty_dict, list, NULL);
-    #endif
-bad:
-    Py_XDECREF(empty_list);
-    Py_XDECREF(py_import);
-    Py_XDECREF(empty_dict);
-    return module;
-}
-""" % {
-    "BUILTINS": Naming.builtins_cname,
-    "GLOBALS":  Naming.module_cname,
-})
 
 #------------------------------------------------------------------------------------
 

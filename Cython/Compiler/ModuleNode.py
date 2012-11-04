@@ -477,6 +477,13 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         typecode = globalstate['type_declarations']
         typecode.putln("")
         typecode.putln("/*--- Type declarations ---*/")
+        # This is to work around the fact that array.h isn't part of the C-API,
+        # but we need to declare it earlier than utility code.
+        if 'cpython.array' in [m.qualified_name for m in modules]:
+            typecode.putln('#ifndef _ARRAYARRAY_H')
+            typecode.putln('struct arrayobject;')
+            typecode.putln('typedef struct arrayobject arrayobject;')
+            typecode.putln('#endif')
         vtab_list, vtabslot_list = self.sort_type_hierarchy(modules, env)
         self.generate_type_definitions(
             env, modules, vtab_list, vtabslot_list, typecode)
@@ -1123,7 +1130,11 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             code.putln("if (p->__weakref__) PyObject_ClearWeakRefs(o);")
 
         for entry in cpp_class_attrs:
-            destructor_name = entry.type.cname.split("::")[-1]
+            split_cname = entry.type.cname.split('::')
+            destructor_name = split_cname.pop()
+            # Make sure the namespace delimiter was not in a template arg.
+            while destructor_name.count('<') != destructor_name.count('>'):
+                destructor_name = split_cname.pop() + '::' + destructor_name
             code.putln("p->%s.%s::~%s();" %
                 (entry.cname, entry.type.declaration_code(""), destructor_name))
 
@@ -2077,16 +2088,17 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                 Naming.pymoduledef_cname))
         code.putln("#endif")
         code.putln(code.error_goto_if_null(env.module_cname, self.pos))
-        if env.is_package:
-            # CPython may not have put us into sys.modules yet, but relative imports require it
-            code.putln("{")
-            code.putln("PyObject *modules = PyImport_GetModuleDict(); %s" %
-                       code.error_goto_if_null("modules", self.pos))
-            code.putln('if (!PyDict_GetItemString(modules, "%s")) {' % env.module_name)
-            code.putln(code.error_goto_if_neg('PyDict_SetItemString(modules, "%s", %s)' % (
-                env.module_name, env.module_cname), self.pos))
-            code.putln("}")
-            code.putln("}")
+        # CPython may not have put us into sys.modules yet, but relative imports and reimports require it
+        code.putln("#if PY_MAJOR_VERSION >= 3")
+        code.putln("{")
+        code.putln("PyObject *modules = PyImport_GetModuleDict(); %s" %
+                   code.error_goto_if_null("modules", self.pos))
+        code.putln('if (!PyDict_GetItemString(modules, "%s")) {' % env.qualified_name)
+        code.putln(code.error_goto_if_neg('PyDict_SetItemString(modules, "%s", %s)' % (
+            env.qualified_name, env.module_cname), self.pos))
+        code.putln("}")
+        code.putln("}")
+        code.putln("#endif")
         code.putln(
             '%s = PyImport_AddModule(__Pyx_NAMESTR(__Pyx_BUILTIN_MODULE_NAME)); %s' % (
                 Naming.builtins_cname,
