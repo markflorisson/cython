@@ -20,7 +20,6 @@ Options:
   -o, --output-file <filename>   Specify name of generated C file
   -t, --timestamps               Only compile newer source files
   -f, --force                    Compile all source files (overrides implied -t)
-  -q, --quiet                    Don't print module names in recursive mode
   -v, --verbose                  Be verbose, print file names on multiple compilation
   -p, --embed-positions          If specified, the positions in Cython files of each
                                  function definition is embedded in its docstring.
@@ -37,8 +36,9 @@ Options:
   --embed[=<method_name>]        Generate a main() function that embeds the Python interpreter.
   -2                             Compile based on Python-2 syntax and code semantics.
   -3                             Compile based on Python-3 syntax and code semantics.
+  --capi-reexport-cincludes      Add cincluded headers to any auto-generated header files.
   --fast-fail                    Abort the compilation on the first error
-  --warning-error, -Werror       Make all warnings into errors
+  --warning-errors, -Werror      Make all warnings into errors
   --warning-extra, -Wextra       Enable extra warnings
   -X, --directive <name>=<value>[,<name=value,...] Overrides a compiler directive
 """
@@ -129,6 +129,8 @@ def parse_command_line(args):
                 options.language_level = 2
             elif option == '-3':
                 options.language_level = 3
+            elif option == "--capi-reexport-cincludes":
+                options.capi_reexport_cincludes = True
             elif option == "--fast-fail":
                 Options.fast_fail = True
             elif option in ('-Werror', '--warning-errors'):

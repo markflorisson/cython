@@ -81,6 +81,7 @@ directive_defaults = {
     'auto_cpdef': False,
     'cdivision': False, # was True before 0.12
     'cdivision_warnings': False,
+    'overflowcheck': False,
     'always_allow_keywords': False,
     'allow_none_for_extension_args': True,
     'wraparound' : True,
@@ -98,8 +99,8 @@ directive_defaults = {
     'fast_getattr': False, # Undocumented until we come up with a better way to handle this everywhere.
     'py2_import': False, # For backward compatibility of Cython's source code in Py3 source mode
 
-    # set __file__ and/or __path__ to source file path at import time (instead of not having them available)
-    'set_initial_path_from_source' : False,
+    # set __file__ and/or __path__ to known source/target path at import time (instead of not having them available)
+    'set_initial_path' : None,  # SOURCEFILE or "/full/path/to/module"
 
     'warn': None,
     'warn.undeclared': False,
@@ -124,7 +125,8 @@ directive_defaults = {
     'test_fail_if_path_exists' : [],
 
 # experimental, subject to change
-    'binding': False,
+    'binding': None,
+    'experimental_cpp_class_def': False
 }
 
 # Extra warning directives
@@ -139,10 +141,12 @@ directive_types = {
     'final' : bool,  # final cdef classes and methods
     'internal' : bool,  # cdef class visibility in the module dict
     'infer_types' : bool, # values can be True/None/False
+    'binding' : bool,
     'cfunc' : None, # decorators do not take directive value
     'ccall' : None,
     'cclass' : None,
     'returns' : type,
+    'set_initial_path': str,
     }
 
 for key, val in directive_defaults.items():
@@ -156,7 +160,7 @@ directive_scopes = { # defaults to available everywhere
     'autotestdict' : ('module',),
     'autotestdict.all' : ('module',),
     'autotestdict.cdef' : ('module',),
-    'set_initial_path_from_source' : ('module',),
+    'set_initial_path' : ('module',),
     'test_assert_path_exists' : ('function', 'class', 'cclass'),
     'test_fail_if_path_exists' : ('function', 'class', 'cclass'),
 }

@@ -247,8 +247,8 @@ cdef class ErrorBuffer:
 # Structs
 #
 cdef struct MyStruct:
-    char a
-    char b
+    signed char a
+    signed char b
     long long int c
     int d
     int e
@@ -263,11 +263,11 @@ cdef struct NestedStruct:
     int z
 
 cdef packed struct PackedStruct:
-    char a
+    signed char a
     int b
 
 cdef struct NestedPackedStruct:
-    char a
+    signed char a
     int b
     PackedStruct sub
     int c
@@ -280,7 +280,7 @@ cdef class MyStructMockBuffer(MockBuffer):
         return 0
 
     cdef get_itemsize(self): return sizeof(MyStruct)
-    cdef get_default_format(self): return b"2bq2i"
+    cdef get_default_format(self): return b"2cq2i"
 
 cdef class NestedStructMockBuffer(MockBuffer):
     cdef int write(self, char* buf, object value) except -1:

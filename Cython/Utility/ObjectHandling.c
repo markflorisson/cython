@@ -16,7 +16,7 @@ static CYTHON_INLINE void __Pyx_RaiseTooManyValuesError(Py_ssize_t expected);
 
 static CYTHON_INLINE void __Pyx_RaiseTooManyValuesError(Py_ssize_t expected) {
     PyErr_Format(PyExc_ValueError,
-                 "too many values to unpack (expected %" PY_FORMAT_SIZE_T "d)", expected);
+                 "too many values to unpack (expected %" CYTHON_FORMAT_SSIZE_T "d)", expected);
 }
 
 /////////////// RaiseNeedMoreValuesToUnpack.proto ///////////////
@@ -27,7 +27,7 @@ static CYTHON_INLINE void __Pyx_RaiseNeedMoreValuesError(Py_ssize_t index);
 
 static CYTHON_INLINE void __Pyx_RaiseNeedMoreValuesError(Py_ssize_t index) {
     PyErr_Format(PyExc_ValueError,
-                 "need more than %" PY_FORMAT_SIZE_T "d value%s to unpack",
+                 "need more than %" CYTHON_FORMAT_SSIZE_T "d value%s to unpack",
                  index, (index == 1) ? "" : "s");
 }
 
@@ -575,3 +575,23 @@ static CYTHON_INLINE int __Pyx_TypeTest(PyObject *obj, PyTypeObject *type) {
 #else
 #define __Pyx_PyCallable_Check(obj)   PyCallable_Check(obj)
 #endif
+
+/////////////// PyDictContains.proto ///////////////
+
+static CYTHON_INLINE int __Pyx_PyDict_Contains(PyObject* item, PyObject* dict, int eq) {
+    int result = PyDict_Contains(dict, item);
+    return unlikely(result < 0) ? result : (result == (eq == Py_EQ));
+}
+
+/////////////// PySequenceContains.proto ///////////////
+
+static CYTHON_INLINE int __Pyx_PySequence_Contains(PyObject* item, PyObject* seq, int eq) {
+    int result = PySequence_Contains(seq, item);
+    return unlikely(result < 0) ? result : (result == (eq == Py_EQ));
+}
+
+/////////////// PyBoolOrNullFromLong.proto ///////////////
+
+static CYTHON_INLINE PyObject* __Pyx_PyBoolOrNull_FromLong(long b) {
+    return unlikely(b < 0) ? NULL : __Pyx_PyBool_FromLong(b);
+}

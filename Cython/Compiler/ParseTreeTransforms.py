@@ -1611,6 +1611,7 @@ if VALUE is not None:
                     decorator.pos,
                     function = decorator.decorator,
                     args = [rhs])
+            def_node.decorators = None
 
         assmt = Nodes.SingleAssignmentNode(
             def_node.pos,
@@ -1640,6 +1641,12 @@ if VALUE is not None:
         node.analyse_declarations(self.env_stack[-1])
         return node
 
+    def visit_CppClassNode(self, node):
+        if node.visibility == 'extern':
+            return None
+        else:
+            return self.visit_ClassDefNode(node)
+    
     def visit_CStructOrUnionDefNode(self, node):
         # Create a wrapper node if needed.
         # We want to use the struct type information (so it can't happen
@@ -1990,13 +1997,12 @@ class AlignFunctionDefinitions(CythonTransform):
         if pxd_def:
             if pxd_def.is_cclass:
                 return self.visit_CClassDefNode(node.as_cclass(), pxd_def)
-            else:
+            elif not pxd_def.scope or not pxd_def.scope.is_builtin_scope:
                 error(node.pos, "'%s' redeclared" % node.name)
                 if pxd_def.pos:
                     error(pxd_def.pos, "previous declaration here")
                 return None
-        else:
-            return node
+        return node
 
     def visit_CClassDefNode(self, node, pxd_def=None):
         if pxd_def is None:
@@ -2407,6 +2413,9 @@ class TransformBuiltinMethods(EnvTransform):
         if attribute:
             if attribute == u'compiled':
                 node = ExprNodes.BoolNode(node.pos, value=True)
+            elif attribute == u'__version__':
+                import Cython
+                node = ExprNodes.StringNode(node.pos, value=EncodedString(Cython.__version__))
             elif attribute == u'NULL':
                 node = ExprNodes.NullNode(node.pos)
             elif attribute in (u'set', u'frozenset'):

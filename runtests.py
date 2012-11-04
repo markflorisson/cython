@@ -16,6 +16,14 @@ import traceback
 import warnings
 
 try:
+    import platform
+    IS_PYPY = platform.python_implementation() == 'PyPy'
+    IS_CPYTHON = platform.python_implementation() == 'CPython'
+except (ImportError, AttributeError):
+    IS_CPYTHON = True
+    IS_PYPY = False
+
+try:
     from StringIO import StringIO
 except ImportError:
     from io import StringIO
@@ -83,10 +91,6 @@ def update_numpy_extension(ext):
     import numpy
     ext.include_dirs.append(numpy.get_include())
 
-def update_pyarray_extension(ext):
-    # See http://gcc.gnu.org/onlinedocs/gcc/Unnamed-Fields.html#Unnamed-Fields
-    ext.extra_compile_args.append('-fms-extensions')
-
 def update_openmp_extension(ext):
     ext.openmp = True
     language = ext.language
@@ -120,7 +124,9 @@ def get_openmp_compiler_flags(language):
         cc = sysconfig.get_config_var('CC')
 
     if not cc:
-        return None # Windows?
+        if sys.platform == 'win32':
+            return '/openmp', ''
+        return None
 
     # For some reason, cc can be e.g. 'gcc -pthread'
     cc = cc.split()[0]
@@ -162,7 +168,6 @@ EXCLUDE_EXT = object()
 
 EXT_EXTRAS = {
     'tag:numpy' : update_numpy_extension,
-    'tag:array' : update_pyarray_extension,
     'tag:openmp': update_openmp_extension,
 }
 
@@ -183,6 +188,7 @@ VER_DEP_MODULES = {
                                           'run.initial_file_path',  # relative import
                                           ]),
     (2,6) : (operator.lt, lambda x: x in ['run.print_function',
+                                          'run.language_level', # print function
                                           'run.cython3',
                                           'run.property_decorator_T593', # prop.setter etc.
                                           'run.generators_py', # generators, with statement
@@ -210,8 +216,6 @@ VER_DEP_MODULES = {
                                         'compile.extsetslice',
                                         'compile.extdelslice',
                                         'run.special_methods_T561_py2']),
-    (3,3): (operator.ge, lambda x: x in ['run.initial_file_path', # new importlib currently fails to load __init__.so
-                                         ]),
 }
 
 # files that should not be converted to Python 3 code with 2to3
@@ -428,9 +432,10 @@ class TestBuilder(object):
 
     def build_test(self, test_class, path, workdir, module,
                    language, expect_errors, warning_errors):
-        workdir = os.path.join(workdir, language)
-        if not os.path.exists(workdir):
-            os.makedirs(workdir)
+        language_workdir = os.path.join(workdir, language)
+        if not os.path.exists(language_workdir):
+            os.makedirs(language_workdir)
+        workdir = os.path.join(language_workdir, module)
         return test_class(path, workdir, module,
                           language=language,
                           expect_errors=expect_errors,
@@ -473,6 +478,8 @@ class CythonCompileTestCase(unittest.TestCase):
         self._saved_default_directives = Options.directive_defaults.items()
         Options.warning_errors = self.warning_errors
 
+        if not os.path.exists(self.workdir):
+            os.makedirs(self.workdir)
         if self.workdir not in sys.path:
             sys.path.insert(0, self.workdir)
 
@@ -494,24 +501,25 @@ class CythonCompileTestCase(unittest.TestCase):
         cleanup_c_files = WITH_CYTHON and self.cleanup_workdir and cleanup
         cleanup_lib_files = self.cleanup_sharedlibs and cleanup
         if os.path.exists(self.workdir):
-            for rmfile in os.listdir(self.workdir):
-                if not cleanup_c_files:
-                    if (rmfile[-2:] in (".c", ".h") or
-                        rmfile[-4:] == ".cpp" or
-                        rmfile.endswith(".html")):
+            if cleanup_c_files and cleanup_lib_files:
+                shutil.rmtree(self.workdir, ignore_errors=True)
+            else:
+                for rmfile in os.listdir(self.workdir):
+                    if not cleanup_c_files:
+                        if (rmfile[-2:] in (".c", ".h") or
+                            rmfile[-4:] == ".cpp" or
+                            rmfile.endswith(".html")):
+                            continue
+                    if not cleanup_lib_files and (rmfile.endswith(".so") or rmfile.endswith(".dll")):
                         continue
-                if not cleanup_lib_files and (rmfile.endswith(".so") or rmfile.endswith(".dll")):
-                    continue
-                try:
-                    rmfile = os.path.join(self.workdir, rmfile)
-                    if os.path.isdir(rmfile):
-                        shutil.rmtree(rmfile, ignore_errors=True)
-                    else:
-                        os.remove(rmfile)
-                except IOError:
-                    pass
-        else:
-            os.makedirs(self.workdir)
+                    try:
+                        rmfile = os.path.join(self.workdir, rmfile)
+                        if os.path.isdir(rmfile):
+                            shutil.rmtree(rmfile, ignore_errors=True)
+                        else:
+                            os.remove(rmfile)
+                    except IOError:
+                        pass
 
     def runTest(self):
         self.success = False
@@ -553,7 +561,6 @@ class CythonCompileTestCase(unittest.TestCase):
             out = io_open(os.path.join(workdir, module + os.path.splitext(source_file)[1]),
                               'w', encoding='ISO-8859-1')
             for line in source_and_output:
-                last_line = line
                 if line.startswith("_ERRORS"):
                     out.close()
                     out = ErrorWriter()
@@ -743,14 +750,14 @@ class CythonRunTestCase(CythonCompileTestCase):
             tests.run(result)
         run_forked_test(result, run_test, self.shortDescription(), self.fork)
 
-
 def run_forked_test(result, run_func, test_name, fork=True):
     if not fork or sys.version_info[0] >= 3 or not hasattr(os, 'fork'):
         run_func(result)
+        sys.stdout.flush()
+        sys.stderr.flush()
         gc.collect()
         return
 
-    module_name = test_name.split()[-1]
     # fork to make sure we do not keep the tested module loaded
     result_handle, result_file = tempfile.mkstemp()
     os.close(result_handle)
@@ -763,6 +770,8 @@ def run_forked_test(result, run_func, test_name, fork=True):
                 try:
                     partial_result = PartialTestResult(result)
                     run_func(partial_result)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                     gc.collect()
                 except Exception:
                     if tests is None:
@@ -791,7 +800,7 @@ def run_forked_test(result, run_func, test_name, fork=True):
         if result_code & 255:
             raise Exception("Tests in module '%s' were unexpectedly killed by signal %d"%
                             (module_name, result_code & 255))
-        result_code = result_code >> 8
+        result_code >>= 8
         if result_code in (0,1):
             input = open(result_file, 'rb')
             try:
@@ -905,7 +914,9 @@ class CythonPyregrTestCase(CythonRunTestCase):
         CythonRunTestCase.setUp(self)
         from Cython.Compiler import Options
         Options.error_on_unknown_names = False
-        Options.directive_defaults.update(dict(binding=True, always_allow_keywords=True))
+        Options.directive_defaults.update(dict(
+            binding=True, always_allow_keywords=True,
+            set_initial_path="SOURCEFILE"))
 
     def _run_unittest(self, result, *classes):
         """Run tests from unittest.TestCase-derived classes."""
@@ -938,19 +949,26 @@ class CythonPyregrTestCase(CythonRunTestCase):
             def run_doctest(module, verbosity=None):
                 return self._run_doctest(result, module)
 
+            backup = (support.run_unittest, support.run_doctest)
             support.run_unittest = run_unittest
             support.run_doctest = run_doctest
 
             try:
-                module = __import__(self.module)
-                if hasattr(module, 'test_main'):
-                    module.test_main()
-            except (unittest.SkipTest, support.ResourceDenied):
-                result.addSkip(self, 'ok')
+                try:
+                    sys.stdout.flush() # helps in case of crashes
+                    module = __import__(self.module)
+                    sys.stdout.flush() # helps in case of crashes
+                    if hasattr(module, 'test_main'):
+                        module.test_main()
+                        sys.stdout.flush() # helps in case of crashes
+                except (unittest.SkipTest, support.ResourceDenied):
+                    result.addSkip(self, 'ok')
+            finally:
+                support.run_unittest, support.run_doctest = backup
 
         run_forked_test(result, run_test, self.shortDescription(), self.fork)
 
-include_debugger = sys.version_info[:2] > (2, 5)
+include_debugger = IS_CPYTHON and sys.version_info[:2] > (2, 5)
 
 def collect_unittests(path, module_prefix, suite, selectors, exclude_selectors):
     def file_matches(filename):
@@ -1048,14 +1066,14 @@ class EndToEndTest(unittest.TestCase):
         self.treefile = treefile
         self.workdir = os.path.join(workdir, self.name)
         self.cleanup_workdir = cleanup_workdir
-        cython_syspath = self.cython_root
-        for path in sys.path[::-1]:
-            if path.startswith(self.cython_root):
+        cython_syspath = [self.cython_root]
+        for path in sys.path:
+            if path.startswith(self.cython_root) and path not in cython_syspath:
                 # Py3 installation and refnanny build prepend their
                 # fixed paths to sys.path => prefer that over the
-                # generic one
-                cython_syspath = path + os.pathsep + cython_syspath
-        self.cython_syspath = cython_syspath
+                # generic one (cython_root itself goes last)
+                cython_syspath.append(path)
+        self.cython_syspath = os.pathsep.join(cython_syspath[::-1])
         unittest.TestCase.__init__(self)
 
     def shortDescription(self):
@@ -1091,9 +1109,9 @@ class EndToEndTest(unittest.TestCase):
         commands = (self.commands
             .replace("CYTHON", "PYTHON %s" % os.path.join(self.cython_root, 'cython.py'))
             .replace("PYTHON", sys.executable))
+        old_path = os.environ.get('PYTHONPATH')
+        os.environ['PYTHONPATH'] = self.cython_syspath + os.pathsep + (old_path or '')
         try:
-            old_path = os.environ.get('PYTHONPATH')
-            os.environ['PYTHONPATH'] = self.cython_syspath + os.pathsep + os.path.join(self.cython_syspath, (old_path or ''))
             for command in commands.split('\n'):
                 p = subprocess.Popen(commands,
                                      stderr=subprocess.PIPE,
@@ -1346,7 +1364,7 @@ def flush_and_terminate(status):
 
 def main():
 
-    global DISTDIR
+    global DISTDIR, WITH_CYTHON
     DISTDIR = os.path.join(os.getcwd(), os.path.dirname(sys.argv[0]))
 
     from optparse import OptionParser
@@ -1446,6 +1464,8 @@ def main():
                       help="configure for easier use with a debugger (e.g. gdb)")
     parser.add_option("--pyximport-py", dest="pyximport_py", default=False, action="store_true",
                       help="use pyximport to automatically compile imported .pyx and .py files")
+    parser.add_option("--watermark", dest="watermark", default=None,
+                      help="deterministic generated by string")
 
     options, cmd_args = parser.parse_args()
 
@@ -1474,6 +1494,10 @@ def main():
                     sys.path.insert(0, cy3_dir)
                 else:
                     options.with_cython = False
+
+    if options.watermark:
+        import Cython.Compiler.Version
+        Cython.Compiler.Version.watermark = options.watermark
 
     WITH_CYTHON = options.with_cython
 
@@ -1569,7 +1593,7 @@ def runtests(options, cmd_args, coverage=None):
         options.cleanup_workdir = False
         options.cleanup_sharedlibs = False
         options.fork = False
-        if WITH_CYTHON:
+        if WITH_CYTHON and include_debugger:
             from Cython.Compiler.Main import default_options as compiler_default_options
             compiler_default_options['gdb_debug'] = True
             compiler_default_options['output_dir'] = os.getcwd()

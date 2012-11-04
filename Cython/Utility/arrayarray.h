@@ -1,25 +1,27 @@
 /////////////// ArrayAPI.proto ///////////////
 
-/* arrayarray.h  
-
-    Artificial C-API for Python's <array.array> type,
-    used by array.pxd
-    
-    last changes: 2009-05-15 rk
-                  2012-05-02 andreasvc
-                  (see revision control)
-
-*/
+// arrayarray.h
+//
+//    Artificial C-API for Python's <array.array> type,
+//    used by array.pxd
+//
+//    last changes: 2009-05-15 rk
+//                  2012-05-02 andreasvc
+//                  (see revision control)
+//
 
 #ifndef _ARRAYARRAY_H
 #define _ARRAYARRAY_H
 
-struct arrayobject; /* Forward */
+// These two forward declarations are explicitly handled in the type
+// declaration code, as including them here is too late for cython-defined
+// types to use them.
+// struct arrayobject;
+// typedef struct arrayobject arrayobject;
 
-/* All possible arraydescr values are defined in the vector "descriptors"
- * below.  That's defined later because the appropriate get and set
- * functions aren't visible yet.
- */
+// All possible arraydescr values are defined in the vector "descriptors"
+// below.  That's defined later because the appropriate get and set
+// functions aren't visible yet.
 typedef struct arraydescr {
     int typecode;
     int itemsize;
@@ -31,46 +33,35 @@ typedef struct arraydescr {
 } arraydescr;
 
 
-typedef struct arrayobject {
+struct arrayobject {
     PyObject_HEAD
-    union {
-        Py_ssize_t ob_size, length;
-    };
+    Py_ssize_t ob_size;
     union {
         char *ob_item;
-        float *_f;
-        double *_d;
-        int *_i;
-        unsigned *_I;
-        unsigned char *_B;
-        signed char *_b;
-        char *_c;
-        unsigned long *_L;
-        long *_l;
-        short *_h;
-        unsigned short *_H;
-        Py_UNICODE *_u;
-        void *_v;
-    };
-#if PY_VERSION_HEX >= 0x02040000
+        float *as_floats;
+        double *as_doubles;
+        int *as_ints;
+        unsigned int *as_uints;
+        unsigned char *as_uchars;
+        signed char *as_schars;
+        char *as_chars;
+        unsigned long *as_ulongs;
+        long *as_longs;
+        short *as_shorts;
+        unsigned short *as_ushorts;
+        Py_UNICODE *as_pyunicodes;
+        void *as_voidptr;
+    } data;
     Py_ssize_t allocated;
-#endif
     struct arraydescr *ob_descr;
-#if PY_VERSION_HEX >= 0x02040000
     PyObject *weakreflist; /* List of weak references */
-#endif
 #if PY_VERSION_HEX >= 0x03000000
         int ob_exports;  /* Number of exported buffers */
 #endif
-} arrayobject;
-
+};
 
 #ifndef NO_NEWARRAY_INLINE
-/* 
- * 
- *  fast creation of a new array
- */
-
+//  fast creation of a new array
 static CYTHON_INLINE PyObject * newarrayobject(PyTypeObject *type, Py_ssize_t size,
     struct arraydescr *descr) {
     arrayobject *op;
@@ -82,7 +73,7 @@ static CYTHON_INLINE PyObject * newarrayobject(PyTypeObject *type, Py_ssize_t si
     }
 
     nbytes = size * descr->itemsize;
-    /* Check for overflow */
+    // Check for overflow
     if (nbytes / descr->itemsize != (size_t)size) {
         return PyErr_NoMemory();
     }
@@ -91,17 +82,15 @@ static CYTHON_INLINE PyObject * newarrayobject(PyTypeObject *type, Py_ssize_t si
         return NULL;
     }
     op->ob_descr = descr;
-#if !( PY_VERSION_HEX < 0x02040000 )
     op->allocated = size;
     op->weakreflist = NULL;
-#endif
-    Py_SIZE(op) = size;
+    op->ob_size = size;
     if (size <= 0) {
-        op->ob_item = NULL;
+        op->data.ob_item = NULL;
     }
     else {
-        op->ob_item = PyMem_NEW(char, nbytes);
-        if (op->ob_item == NULL) {
+        op->data.ob_item = PyMem_NEW(char, nbytes);
+        if (op->data.ob_item == NULL) {
             Py_DECREF(op);
             return PyErr_NoMemory();
         }
@@ -113,28 +102,25 @@ PyObject* newarrayobject(PyTypeObject *type, Py_ssize_t size,
     struct arraydescr *descr);
 #endif /* ifndef NO_NEWARRAY_INLINE */
 
-/* fast resize (reallocation to the point) 
-   not designed for filing small increments (but for fast opaque array apps) */
-static int resize(arrayobject *self, Py_ssize_t n) {
-    void *item= (void*) self->ob_item;
-    PyMem_Resize(item, char, (size_t)(n * self->ob_descr->itemsize));
-    if (item == NULL) {
+// fast resize (reallocation to the point)
+// not designed for filing small increments (but for fast opaque array apps)
+static CYTHON_INLINE int resize(arrayobject *self, Py_ssize_t n) {
+    void *items = (void*) self->data.ob_item;
+    PyMem_Resize(items, char, (size_t)(n * self->ob_descr->itemsize));
+    if (items == NULL) {
         PyErr_NoMemory();
         return -1;
     }    
-    self->ob_item = (char*) item;
+    self->data.ob_item = (char*) items;
     self->ob_size = n;
-#if PY_VERSION_HEX >= 0x02040000
     self->allocated = n;
-#endif
     return 0;
 }
 
-/* suitable for small increments; over allocation 50% ;
-   Remains non-smart in Python 2.3- ; but exists for compatibility */
-static int resize_smart(arrayobject *self, Py_ssize_t n) {
-#if PY_VERSION_HEX >= 0x02040000
-    void *item = (void*) self->ob_item;
+// suitable for small increments; over allocation 50% ;
+// Remains non-smart in Python 2.3- ; but exists for compatibility
+static CYTHON_INLINE int resize_smart(arrayobject *self, Py_ssize_t n) {
+    void *items = (void*) self->data.ob_item;
     Py_ssize_t newsize;
     if (n < self->allocated) {
         if (n*4 > self->allocated) {
@@ -143,20 +129,16 @@ static int resize_smart(arrayobject *self, Py_ssize_t n) {
         }
     }
     newsize = n  * 3 / 2 + 1;
-    PyMem_Resize(item, char, (size_t)(newsize * self->ob_descr->itemsize));
-    if (item == NULL) {
+    PyMem_Resize(items, char, (size_t)(newsize * self->ob_descr->itemsize));
+    if (items == NULL) {
         PyErr_NoMemory();
         return -1;
     }    
-    self->ob_item = (char*) item;
+    self->data.ob_item = (char*) items;
     self->ob_size = n;
     self->allocated = newsize;
     return 0;
-#else
-    return resize(self, n)   /* Python 2.3 has no 'allocated' */
-#endif
 }
-
 
 #endif
 /* _ARRAYARRAY_H */

@@ -1187,7 +1187,7 @@ class EarlyReplaceBuiltinCalls(Visitor.EnvTransform):
 
     Introducing C function calls here may not be a good idea.  Move
     them to the OptimizeBuiltinCalls transform instead, which runs
-    after type analyis.
+    after type analysis.
     """
     # only intercept on call nodes
     visit_Node = Visitor.VisitorTransform.recurse_to_children
@@ -1258,7 +1258,7 @@ class EarlyReplaceBuiltinCalls(Visitor.EnvTransform):
     # specific handlers for simple call nodes
 
     def _handle_simple_function_float(self, node, pos_args):
-        if len(pos_args) == 0:
+        if not pos_args:
             return ExprNodes.FloatNode(node.pos, value='0.0')
         if len(pos_args) > 1:
             self._error_wrong_arg_count('float', node, pos_args, 1)
@@ -1982,6 +1982,8 @@ class OptimizeBuiltinCalls(Visitor.MethodDispatcherTransform):
         Builtin.frozenset_type : "PySet_Size",
         }.get
 
+    _ext_types_with_pysize = set(["cpython.array.array"])
+
     def _handle_simple_function_len(self, node, pos_args):
         """Replace len(char*) by the equivalent call to strlen() and
         len(known_builtin_type) by an equivalent C-API call.
@@ -2001,7 +2003,12 @@ class OptimizeBuiltinCalls(Visitor.MethodDispatcherTransform):
         elif arg.type.is_pyobject:
             cfunc_name = self._map_to_capi_len_function(arg.type)
             if cfunc_name is None:
-                return node
+                arg_type = arg.type
+                if ((arg_type.is_extension_type or arg_type.is_builtin_type)
+                    and arg_type.entry.qualified_name in self._ext_types_with_pysize):
+                    cfunc_name = 'Py_SIZE'
+                else:
+                    return node
             arg = arg.as_none_safe_node(
                 "object of type 'NoneType' has no len()")
             new_node = ExprNodes.PythonCapiCallNode(
@@ -3113,6 +3120,15 @@ class ConstantFolding(Visitor.VisitorTransform, SkipDeclarations):
         if not if_clauses:
             return node.else_clause
         node.if_clauses = if_clauses
+        return node
+
+    def visit_ForInStatNode(self, node):
+        self.visitchildren(node)
+        # iterating over a list literal? => tuples are more efficient
+        sequence = node.iterator.sequence
+        if isinstance(sequence, ExprNodes.ListNode):
+            node.iterator.sequence = ExprNodes.TupleNode(
+                sequence.pos, args=sequence.args, mult_factor=sequence.mult_factor)
         return node
 
     # in the future, other nodes can have their own handler method here

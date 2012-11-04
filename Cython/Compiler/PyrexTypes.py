@@ -25,7 +25,7 @@ class BaseType(object):
         # This is not entirely robust.
         safe = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_0123456789'
         all = []
-        for c in self.declaration_code("").replace(" ", "__"):
+        for c in self.declaration_code("").replace("unsigned ", "unsigned_").replace("long long", "long_long").replace(" ", "__"):
             if c in safe:
                 all.append(c)
             else:
@@ -138,6 +138,7 @@ class PyrexType(BaseType):
     #  is_ptr                boolean     Is a C pointer type
     #  is_null_ptr           boolean     Is the type of NULL
     #  is_reference          boolean     Is a C reference type
+    #  is_const              boolean     Is a C const type.
     #  is_cfunction          boolean     Is a C function type
     #  is_struct_or_union    boolean     Is a C struct or union type
     #  is_struct             boolean     Is a C struct type
@@ -192,6 +193,7 @@ class PyrexType(BaseType):
     is_ptr = 0
     is_null_ptr = 0
     is_reference = 0
+    is_const = 0
     is_cfunction = 0
     is_struct_or_union = 0
     is_cpp_class = 0
@@ -399,6 +401,26 @@ class CTypedefType(BaseType):
                 return True
         # delegation
         return self.typedef_base_type.create_from_py_utility_code(env)
+
+    def overflow_check_binop(self, binop, env, const_rhs=False):
+        env.use_utility_code(UtilityCode.load("Common", "Overflow.c"))
+        type = self.declaration_code("")
+        name = self.specialization_name()
+        if binop == "lshift":
+            env.use_utility_code(TempitaUtilityCode.load(
+                "LeftShift", "Overflow.c",
+                context={'TYPE': type, 'NAME': name, 'SIGNED': self.signed}))
+        else:
+            if const_rhs:
+                binop += "_const"
+            _load_overflow_base(env)
+            env.use_utility_code(TempitaUtilityCode.load(
+                "SizeCheck", "Overflow.c",
+                context={'TYPE': type, 'NAME': name}))
+            env.use_utility_code(TempitaUtilityCode.load(
+                "Binop", "Overflow.c",
+                context={'TYPE': type, 'NAME': name, 'BINOP': binop}))
+        return "__Pyx_%s_%s_checking_overflow" % (binop, name)
 
     def error_condition(self, result_code):
         if self.typedef_is_external:
@@ -1151,6 +1173,42 @@ class CType(PyrexType):
             return 0
 
 
+class CConstType(BaseType):
+
+    is_const = 1
+    
+    def __init__(self, const_base_type):
+        self.const_base_type = const_base_type
+        if const_base_type.has_attributes and const_base_type.scope is not None:
+            import Symtab
+            self.scope = Symtab.CConstScope(const_base_type.scope)
+
+    def __repr__(self):
+        return "<CConstType %s>" % repr(self.const_base_type)
+
+    def __str__(self):
+        return self.declaration_code("", for_display=1)
+
+    def declaration_code(self, entity_code,
+            for_display = 0, dll_linkage = None, pyrex = 0):
+        return self.const_base_type.declaration_code("const %s" % entity_code, for_display, dll_linkage, pyrex)
+
+    def specialize(self, values):
+        base_type = self.const_base_type.specialize(values)
+        if base_type == self.const_base_type:
+            return self
+        else:
+            return ConstType(base_type)
+
+    def create_to_py_utility_code(self, env):
+        if self.const_base_type.create_to_py_utility_code(env):
+            self.to_py_function = self.const_base_type.to_py_function
+            return True
+
+    def __getattr__(self, name):
+        return getattr(self.const_base_type, name)
+
+
 class FusedType(CType):
     """
     Represents a Fused Type. All it needs to do is keep track of the types
@@ -1212,6 +1270,19 @@ class CVoidType(CType):
 
     def is_complete(self):
         return 0
+
+class InvisibleVoidType(CVoidType):
+    #
+    #   For use with C++ constructors and destructors return types.
+    #   Acts like void, but does not print out a declaration.
+    #
+    def declaration_code(self, entity_code,
+            for_display = 0, dll_linkage = None, pyrex = 0):
+        if pyrex or for_display:
+            base_code = "[void]"
+        else:
+            base_code = public_decl("", dll_linkage)
+        return self.base_declaration_code(base_code, entity_code)
 
 
 class CNumericType(CType):
@@ -1495,7 +1566,51 @@ class CIntType(CNumericType):
             # We do not really know the size of the type, so return
             # a 32-bit literal and rely on casting to final type. It will
             # be negative for signed ints, which is good.
-            return "0xbad0bad0";
+            return "0xbad0bad0"
+
+    def overflow_check_binop(self, binop, env, const_rhs=False):
+        env.use_utility_code(UtilityCode.load("Common", "Overflow.c"))
+        type = self.declaration_code("")
+        name = self.specialization_name()
+        if binop == "lshift":
+            env.use_utility_code(TempitaUtilityCode.load(
+                "LeftShift", "Overflow.c",
+                context={'TYPE': type, 'NAME': name, 'SIGNED': not self.signed}))
+        else:
+            if const_rhs:
+                binop += "_const"
+            if type in ('int', 'long', 'long long'):
+                env.use_utility_code(TempitaUtilityCode.load(
+                    "BaseCaseSigned", "Overflow.c",
+                    context={'INT': type, 'NAME': name}))
+            elif type in ('unsigned int', 'unsigned long', 'unsigned long long'):
+                env.use_utility_code(TempitaUtilityCode.load(
+                    "BaseCaseUnsigned", "Overflow.c",
+                    context={'UINT': type, 'NAME': name}))
+            elif self.rank <= 1:
+                # sizeof(short) < sizeof(int)
+                return "__Pyx_%s_%s_no_overflow" % (binop, name)
+            else:
+                _load_overflow_base(env)
+                env.use_utility_code(TempitaUtilityCode.load(
+                    "SizeCheck", "Overflow.c",
+                    context={'TYPE': type, 'NAME': name}))
+                env.use_utility_code(TempitaUtilityCode.load(
+                    "Binop", "Overflow.c",
+                    context={'TYPE': type, 'NAME': name, 'BINOP': binop}))
+        return "__Pyx_%s_%s_checking_overflow" % (binop, name)
+
+def _load_overflow_base(env):
+    env.use_utility_code(UtilityCode.load("Common", "Overflow.c"))
+    for type in ('int', 'long', 'long long'):
+        env.use_utility_code(TempitaUtilityCode.load(
+            "BaseCaseSigned", "Overflow.c",
+            context={'INT': type, 'NAME': type.replace(' ', '_')}))
+    for type in ('unsigned int', 'unsigned long', 'unsigned long long'):
+        env.use_utility_code(TempitaUtilityCode.load(
+            "BaseCaseUnsigned", "Overflow.c",
+            context={'UINT': type, 'NAME': type.replace(' ', '_')}))
+
 
 class CAnonEnumType(CIntType):
 
@@ -1583,7 +1698,7 @@ static CYTHON_INLINE Py_UCS4 __Pyx_PyObject_AsPy_UCS4(PyObject* x) {
        #endif
        PyErr_Format(PyExc_ValueError,
                     "only single character unicode strings can be converted to Py_UCS4, "
-                    "got length %" PY_FORMAT_SIZE_T "d", length);
+                    "got length %" CYTHON_FORMAT_SSIZE_T "d", length);
        return (Py_UCS4)-1;
    }
    ival = __Pyx_PyInt_AsLong(x);
@@ -1638,7 +1753,7 @@ static CYTHON_INLINE Py_UNICODE __Pyx_PyObject_AsPy_UNICODE(PyObject* x) {
         if (unlikely(__Pyx_PyUnicode_GET_LENGTH(x) != 1)) {
             PyErr_Format(PyExc_ValueError,
                          "only single character unicode strings can be converted to Py_UNICODE, "
-                         "got length %" PY_FORMAT_SIZE_T "d", __Pyx_PyUnicode_GET_LENGTH(x));
+                         "got length %" CYTHON_FORMAT_SSIZE_T "d", __Pyx_PyUnicode_GET_LENGTH(x));
             return (Py_UNICODE)-1;
         }
         #if CYTHON_PEP393_ENABLED
@@ -2268,6 +2383,8 @@ class CPtrType(CPointerBaseType):
             return 1
         if other_type.is_null_ptr:
             return 1
+        if self.base_type.is_const:
+            self = CPtrType(self.base_type.const_base_type)
         if self.base_type.is_cfunction:
             if other_type.is_ptr:
                 other_type = other_type.base_type.resolve()
@@ -2315,9 +2432,6 @@ class CReferenceType(BaseType):
     def __str__(self):
         return "%s &" % self.ref_base_type
 
-    def as_argument_type(self):
-        return self
-
     def declaration_code(self, entity_code,
             for_display = 0, dll_linkage = None, pyrex = 0):
         #print "CReferenceType.declaration_code: pointer to", self.base_type ###
@@ -2351,11 +2465,13 @@ class CFuncType(CType):
     #                              C function
     #  is_strict_signature boolean  function refuses to accept coerced arguments
     #                               (used for optimisation overrides)
+    #  is_const_method  boolean
 
     is_cfunction = 1
     original_sig = None
     cached_specialized_types = None
     from_fused = False
+    is_const_method = False
 
     subtypes = ['return_type', 'args']
 
@@ -2562,13 +2678,19 @@ class CFuncType(CType):
             if (not entity_code and cc) or entity_code.startswith("*"):
                 entity_code = "(%s%s)" % (cc, entity_code)
                 cc = ""
+        if self.is_const_method:
+            trailer += " const"
         return self.return_type.declaration_code(
             "%s%s(%s)%s" % (cc, entity_code, arg_decl_code, trailer),
             for_display, dll_linkage, pyrex)
 
     def function_header_code(self, func_name, arg_code):
-        return "%s%s(%s)" % (self.calling_convention_prefix(),
-            func_name, arg_code)
+        if self.is_const_method:
+            trailer = " const"
+        else:
+            trailer = ""
+        return "%s%s(%s)%s" % (self.calling_convention_prefix(),
+            func_name, arg_code, trailer)
 
     def signature_string(self):
         s = self.declaration_code("")
@@ -2586,7 +2708,7 @@ class CFuncType(CType):
 
         result = CFuncType(self.return_type.specialize(values),
                            [arg.specialize(values) for arg in self.args],
-                           has_varargs = 0,
+                           has_varargs = self.has_varargs,
                            exception_value = self.exception_value,
                            exception_check = self.exception_check,
                            calling_convention = self.calling_convention,
@@ -3004,6 +3126,11 @@ class CppClassType(CType):
     has_attributes = 1
     exception_check = True
     namespace = None
+    
+    # For struct-like declaration.
+    kind = "struct"
+    packed = False
+    typedef_flag = False
 
     subtypes = ['templates']
 
@@ -3139,7 +3266,6 @@ class CppClassType(CType):
         return self.base_declaration_code(base_code, entity_code)
 
     def is_subclass(self, other_type):
-        # TODO(danilo): Handle templates.
         if self.same_as_resolved_type(other_type):
             return 1
         for base_class in self.base_classes:
@@ -3151,7 +3277,8 @@ class CppClassType(CType):
         if other_type.is_cpp_class:
             if self == other_type:
                 return 1
-            elif self.template_type and other_type.template_type:
+            elif (self.cname == other_type.cname and
+                  self.template_type and other_type.template_type):
                 if self.templates == other_type.templates:
                     return 1
                 for t1, t2 in zip(self.templates, other_type.templates):
@@ -3783,6 +3910,13 @@ def c_ref_type(base_type):
         return error_type
     else:
         return CReferenceType(base_type)
+
+def c_const_type(base_type):
+    # Construct a C const type.
+    if base_type is error_type:
+        return error_type
+    else:
+        return CConstType(base_type)
 
 def same_type(type1, type2):
     return type1.same_as(type2)

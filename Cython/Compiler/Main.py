@@ -81,9 +81,8 @@ class Context(object):
     def set_language_level(self, level):
         self.language_level = level
         if level >= 3:
-            from Future import print_function, unicode_literals
-            self.future_directives.add(print_function)
-            self.future_directives.add(unicode_literals)
+            from Future import print_function, unicode_literals, absolute_import
+            self.future_directives.update([print_function, unicode_literals, absolute_import])
             self.modules['builtins'] = self.modules['__builtin__']
 
     # pipeline creation functions can now be found in Pipeline.py
@@ -333,8 +332,6 @@ class Context(object):
         module_name, _ = os.path.splitext(filename)
         if "." in module_name:
             return module_name
-        if module_name == "__init__":
-            dir, module_name = os.path.split(dir)
         names = [module_name]
         while self.is_package_dir(dir):
             parent, package_name = os.path.split(dir)
@@ -385,15 +382,17 @@ def create_default_resultobj(compilation_source, options):
         result.c_file = Utils.replace_suffix(source_desc.filename, c_suffix)
     return result
 
-def run_pipeline(source, options, full_module_name = None):
+def run_pipeline(source, options, full_module_name=None, context=None):
     import Pipeline
 
-    context = options.create_context()
+    source_ext = os.path.splitext(source)[1]
+    options.configure_language_defaults(source_ext[1:]) # py/pyx
+    if context is None:
+        context = options.create_context()
 
     # Set up source object
     cwd = os.getcwd()
     abs_path = os.path.abspath(source)
-    source_ext = os.path.splitext(source)[1]
     full_module_name = full_module_name or context.extract_module_name(source, options)
 
     if options.relative_path_in_code_position_comments:
@@ -454,6 +453,9 @@ class CompilationOptions(object):
     include_path      [string]  Directories to search for include files
     output_file       string    Name of generated .c file
     generate_pxi      boolean   Generate .pxi file for public declarations
+    capi_reexport_cincludes  
+                      boolean   Add cincluded headers to any auto-generated 
+                                header files.
     recursive         boolean   Recursively find and compile dependencies
     timestamps        boolean   Only compile changed source files. If None,
                                 defaults to true when recursive is true.
@@ -473,8 +475,21 @@ class CompilationOptions(object):
                 defaults = defaults.__dict__
         else:
             defaults = default_options
-        self.__dict__.update(defaults)
-        self.__dict__.update(kw)
+
+        options = dict(defaults)
+        options.update(kw)
+
+        directives = dict(options['compiler_directives']) # copy mutable field
+        options['compiler_directives'] = directives
+        if 'language_level' in directives and 'language_level' not in kw:
+            options['language_level'] = int(directives['language_level'])
+
+        self.__dict__.update(options)
+
+    def configure_language_defaults(self, source_extension):
+        if source_extension == 'py':
+            if self.compiler_directives.get('binding') is None:
+                self.compiler_directives['binding'] = True
 
     def create_context(self):
         return Context(self.include_path, self.compiler_directives,
@@ -552,16 +567,20 @@ def compile_multiple(sources, options):
     if timestamps is None:
         timestamps = recursive
     verbose = options.verbose or ((recursive or timestamps) and not options.quiet)
+    context = None
     for source in sources:
         if source not in processed:
-            # Compiling multiple sources in one context doesn't quite
-            # work properly yet.
+            if context is None:
+                context = options.create_context()
             if not timestamps or context.c_file_out_of_date(source):
                 if verbose:
                     sys.stderr.write("Compiling %s\n" % source)
 
-                result = run_pipeline(source, options)
+                result = run_pipeline(source, options, context=context)
                 results.add(source, result)
+                # Compiling multiple sources in one context doesn't quite
+                # work properly yet.
+                context = None
             processed.add(source)
             if recursive:
                 for module_name in context.find_cimported_module_names(source):
@@ -638,6 +657,7 @@ default_options = dict(
     output_file = None,
     annotate = None,
     generate_pxi = 0,
+    capi_reexport_cincludes = 0,
     working_path = "",
     recursive = 0,
     timestamps = None,

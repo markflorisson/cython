@@ -34,7 +34,7 @@ import Symtab
 import Options
 from Cython import Utils
 from Annotate import AnnotationItem
-
+from Cython.Compiler import Future
 from Cython.Debugging import print_call_chain
 from DebugFlags import debug_disposal_code, debug_temp_alloc, \
     debug_coercion
@@ -389,7 +389,7 @@ class ExprNode(Node):
     def nonlocally_immutable(self):
         # Returns whether this variable is a safe reference, i.e.
         # can't be modified as part of globals or closures.
-        return self.is_temp or self.type.is_array or self.type.is_cfunction
+        return self.is_literal or self.is_temp or self.type.is_array or self.type.is_cfunction
 
     # --------------- Type Analysis ------------------
 
@@ -617,6 +617,9 @@ class ExprNode(Node):
 
         if dst_type.is_reference and not src_type.is_reference:
             dst_type = dst_type.ref_base_type
+
+        if src_type.is_const:
+            src_type = src_type.const_base_type
 
         if src_type.is_fused or dst_type.is_fused:
             # See if we are coercing a fused function to a pointer to a
@@ -1329,9 +1332,8 @@ class NewExprNode(AtomicExprNode):
         self.cpp_check(env)
         constructor = type.scope.lookup(u'<init>')
         if constructor is None:
-            return_type = PyrexTypes.CFuncType(type, [], exception_check='+')
-            return_type = PyrexTypes.CPtrType(return_type)
-            type.scope.declare_cfunction(u'<init>', return_type, self.pos)
+            func_type = PyrexTypes.CFuncType(type, [], exception_check='+')
+            type.scope.declare_cfunction(u'<init>', func_type, self.pos)
             constructor = type.scope.lookup(u'<init>')
         self.class_type = type
         self.entry = constructor
@@ -1501,8 +1503,6 @@ class NameNode(AtomicExprNode):
             if entry.type.is_buffer:
                 import Buffer
                 Buffer.used_buffer_aux_vars(entry)
-            if entry.utility_code:
-                env.use_utility_code(entry.utility_code)
         self.analyse_rvalue_entry(env)
 
     def analyse_target_types(self, env):
@@ -1514,6 +1514,10 @@ class NameNode(AtomicExprNode):
             self.entry = self.entry.as_variable
             self.type = self.entry.type
 
+        if self.type.is_const:
+            error(self.pos, "Assignment to const '%s'" % self.name)
+        if self.type.is_reference:
+            error(self.pos, "Assignment to reference '%s'" % self.name)
         if not self.is_lvalue():
             error(self.pos, "Assignment to non-lvalue '%s'"
                 % self.name)
@@ -1613,7 +1617,9 @@ class NameNode(AtomicExprNode):
         if ExprNode.nonlocally_immutable(self):
             return True
         entry = self.entry
-        return entry and (entry.is_local or entry.is_arg) and not entry.in_closure
+        if not entry or entry.in_closure:
+            return False
+        return entry.is_local or entry.is_arg or entry.is_builtin or entry.is_readonly
 
     def calculate_target_results(self, env):
         pass
@@ -1671,17 +1677,15 @@ class NameNode(AtomicExprNode):
                         self.result(),
                         namespace,
                         interned_cname))
-            if self.cf_maybe_null:
-                if not self.cf_is_null:
-                    code.putln('if (unlikely(!%s)) {' % self.result())
-                    code.putln('PyErr_Clear();')
-                code.putln(
-                    '%s = __Pyx_GetName(%s, %s);' % (
+                code.putln('if (unlikely(!%s)) {' % self.result())
+                code.putln('PyErr_Clear();')
+            code.putln(
+                '%s = __Pyx_GetName(%s, %s);' % (
                     self.result(),
                     Naming.module_cname,
                     interned_cname))
-                if not self.cf_is_null:
-                    code.putln("}");
+            if not self.cf_is_null:
+                code.putln("}");
             code.putln(code.error_goto_if_null(self.result(), self.pos))
             code.put_gotref(self.py_result())
 
@@ -1933,7 +1937,8 @@ class ImportNode(ExprNode):
 
     def analyse_types(self, env):
         if self.level is None:
-            if env.directives['language_level'] < 3 or env.directives['py2_import']:
+            if (env.directives['py2_import'] or
+                Future.absolute_import not in env.global_scope().context.future_directives):
                 self.level = -1
             else:
                 self.level = 0
@@ -1943,7 +1948,7 @@ class ImportNode(ExprNode):
             self.name_list.analyse_types(env)
             self.name_list.coerce_to_pyobject(env)
         self.is_temp = 1
-        env.use_utility_code(import_utility_code)
+        env.use_utility_code(UtilityCode.load_cached("Import", "ImportExport.c"))
 
     gil_message = "Python import"
 
@@ -1972,6 +1977,7 @@ class IteratorNode(ExprNode):
     type = py_object_type
     iter_func_ptr = None
     counter_cname = None
+    cpp_iterator_cname = None
     reversed = False      # currently only used for list/tuple types (see Optimize.py)
 
     subexprs = ['sequence']
@@ -2008,7 +2014,7 @@ class IteratorNode(ExprNode):
         elif sequence_type.is_cpp_class:
             begin = sequence_type.scope.lookup("begin")
             if begin is not None:
-                return begin.type.base_type.return_type
+                return begin.type.return_type
         elif sequence_type.is_pyobject:
             return sequence_type
         return py_object_type
@@ -2020,25 +2026,23 @@ class IteratorNode(ExprNode):
         begin = sequence_type.scope.lookup("begin")
         end = sequence_type.scope.lookup("end")
         if (begin is None
-            or not begin.type.is_ptr
-            or not begin.type.base_type.is_cfunction
-            or begin.type.base_type.args):
+            or not begin.type.is_cfunction
+            or begin.type.args):
             error(self.pos, "missing begin() on %s" % self.sequence.type)
             self.type = error_type
             return
         if (end is None
-            or not end.type.is_ptr
-            or not end.type.base_type.is_cfunction
-            or end.type.base_type.args):
+            or not end.type.is_cfunction
+            or end.type.args):
             error(self.pos, "missing end() on %s" % self.sequence.type)
             self.type = error_type
             return
-        iter_type = begin.type.base_type.return_type
+        iter_type = begin.type.return_type
         if iter_type.is_cpp_class:
             if env.lookup_operator_for_types(
                     self.pos,
                     "!=",
-                    [iter_type, end.type.base_type.return_type]) is None:
+                    [iter_type, end.type.return_type]) is None:
                 error(self.pos, "missing operator!= on result of begin() on %s" % self.sequence.type)
                 self.type = error_type
                 return
@@ -2052,19 +2056,27 @@ class IteratorNode(ExprNode):
                 return
             self.type = iter_type
         elif iter_type.is_ptr:
-            if not (iter_type == end.type.base_type.return_type):
+            if not (iter_type == end.type.return_type):
                 error(self.pos, "incompatible types for begin() and end()")
             self.type = iter_type
         else:
             error(self.pos, "result type of begin() on %s must be a C++ class or pointer" % self.sequence.type)
             self.type = error_type
             return
-    
+
     def generate_result_code(self, code):
         sequence_type = self.sequence.type
         if sequence_type.is_cpp_class:
+            if self.sequence.is_name:
+                # safe: C++ won't allow you to reassign to class references
+                begin_func = "%s.begin" % self.sequence.result()
+            else:
+                sequence_type = PyrexTypes.c_ptr_type(sequence_type)
+                self.cpp_iterator_cname = code.funcstate.allocate_temp(sequence_type, manage_ref=False)
+                code.putln("%s = &%s;" % (self.cpp_iterator_cname, self.sequence.result()))
+                begin_func = "%s->begin" % self.cpp_iterator_cname
             # TODO: Limit scope.
-            code.putln("%s = %s.begin();" % (self.result(), self.sequence.result()))
+            code.putln("%s = %s();" % (self.result(), begin_func))
             return
         if sequence_type.is_array or sequence_type.is_ptr:
             raise InternalError("for in carray slice not transformed")
@@ -2125,17 +2137,20 @@ class IteratorNode(ExprNode):
             inc_dec = '++'
         code.putln("#if CYTHON_COMPILING_IN_CPYTHON")
         code.putln(
-            "%s = Py%s_GET_ITEM(%s, %s); __Pyx_INCREF(%s); %s%s;" % (
+            "%s = Py%s_GET_ITEM(%s, %s); __Pyx_INCREF(%s); %s%s; %s" % (
                 result_name,
                 test_name,
                 self.py_result(),
                 self.counter_cname,
                 result_name,
                 self.counter_cname,
-                inc_dec))
+                inc_dec,
+                # use the error label to avoid C compiler warnings if we only use it below
+                code.error_goto_if_neg('0', self.pos)
+                ))
         code.putln("#else")
         code.putln(
-            "%s = PySequence_ITEM(%s, %s); %s%s; %s;" % (
+            "%s = PySequence_ITEM(%s, %s); %s%s; %s" % (
                 result_name,
                 self.py_result(),
                 self.counter_cname,
@@ -2149,10 +2164,14 @@ class IteratorNode(ExprNode):
         if self.reversed:
             code.putln("if (%s < 0) break;" % self.counter_cname)
         if sequence_type.is_cpp_class:
+            if self.cpp_iterator_cname:
+                end_func = "%s->end" % self.cpp_iterator_cname
+            else:
+                end_func = "%s.end" % self.sequence.result()
             # TODO: Cache end() call?
-            code.putln("if (!(%s != %s.end())) break;" % (
+            code.putln("if (!(%s != %s())) break;" % (
                             self.result(),
-                            self.sequence.result()));
+                            end_func))
             code.putln("%s = *%s;" % (
                             result_name,
                             self.result()))
@@ -2194,6 +2213,8 @@ class IteratorNode(ExprNode):
         if self.iter_func_ptr:
             code.funcstate.release_temp(self.iter_func_ptr)
             self.iter_func_ptr = None
+        if self.cpp_iterator_cname:
+            code.funcstate.release_temp(self.cpp_iterator_cname)
         ExprNode.free_temps(self, code)
 
 
@@ -2218,9 +2239,11 @@ class NextNode(AtomicExprNode):
         if iterator_type.is_ptr or iterator_type.is_array:
             return iterator_type.base_type
         elif iterator_type.is_cpp_class:
-            item_type = env.lookup_operator_for_types(self.pos, "*", [iterator_type]).type.base_type.return_type
+            item_type = env.lookup_operator_for_types(self.pos, "*", [iterator_type]).type.return_type
             if item_type.is_reference:
                 item_type = item_type.ref_base_type
+            if item_type.is_const:
+                item_type = item_type.const_base_type
             return item_type
         else:
             # Avoid duplication of complicated logic.
@@ -2571,7 +2594,7 @@ class IndexNode(ExprNode):
             ]
             index_func = env.lookup_operator('[]', operands)
             if index_func is not None:
-                return index_func.type.base_type.return_type
+                return index_func.type.return_type
 
         # may be slicing or indexing, we don't know
         if base_type in (unicode_type, str_type):
@@ -2586,6 +2609,8 @@ class IndexNode(ExprNode):
 
     def analyse_target_types(self, env):
         self.analyse_base_and_index_types(env, setting = 1)
+        if self.type.is_const:
+            error(self.pos, "Assignment to const dereference")
         if not self.is_lvalue():
             error(self.pos, "Assignment to non-lvalue of type '%s'" % self.type)
 
@@ -3415,18 +3440,21 @@ class SliceIndexNode(ExprNode):
                   "Slicing is not currently supported for '%s'." % self.type)
             return
         if self.base.type.is_string:
+            base_result = self.base.result()
+            if self.base.type != PyrexTypes.c_char_ptr_type:
+                base_result = '((const char*)%s)' % base_result
             if self.stop is None:
                 code.putln(
                     "%s = PyBytes_FromString(%s + %s); %s" % (
                         self.result(),
-                        self.base.result(),
+                        base_result,
                         self.start_code(),
                         code.error_goto_if_null(self.result(), self.pos)))
             else:
                 code.putln(
                     "%s = PyBytes_FromStringAndSize(%s + %s, %s - %s); %s" % (
                         self.result(),
-                        self.base.result(),
+                        base_result,
                         self.start_code(),
                         self.stop_code(),
                         self.start_code(),
@@ -3532,7 +3560,7 @@ class SliceIndexNode(ExprNode):
             check = stop
         if check:
             code.putln("if (unlikely((%s) != %d)) {" % (check, target_size))
-            code.putln('PyErr_Format(PyExc_ValueError, "Assignment to slice of wrong length, expected %%" PY_FORMAT_SIZE_T "d, got %%" PY_FORMAT_SIZE_T "d", (Py_ssize_t)%d, (Py_ssize_t)(%s));' % (
+            code.putln('PyErr_Format(PyExc_ValueError, "Assignment to slice of wrong length, expected %%" CYTHON_FORMAT_SSIZE_T "d, got %%" CYTHON_FORMAT_SSIZE_T "d", (Py_ssize_t)%d, (Py_ssize_t)(%s));' % (
                         target_size, check))
             code.putln(code.error_goto(self.pos))
             code.putln("}")
@@ -3688,6 +3716,7 @@ class CallNode(ExprNode):
             self.function.entry = constructor
             self.function.set_cname(type.declaration_code(""))
             self.analyse_c_function_call(env)
+            self.type = type
             return True
 
     def is_lvalue(self):
@@ -4430,7 +4459,6 @@ class AttributeNode(ExprNode):
                 # builtin types cannot be inferred as C functions as
                 # that would prevent their use as bound methods
                 self.type = py_object_type
-                return py_object_type
             return self.type
 
     def analyse_target_declaration(self, env):
@@ -4438,6 +4466,8 @@ class AttributeNode(ExprNode):
 
     def analyse_target_types(self, env):
         self.analyse_types(env, target = 1)
+        if self.type.is_const:
+            error(self.pos, "Assignment to const attribute '%s'" % self.attribute)
         if not self.is_lvalue():
             error(self.pos, "Assignment to non-lvalue of type '%s'" % self.type)
 
@@ -4556,6 +4586,7 @@ class AttributeNode(ExprNode):
 
     def analyse_attribute(self, env, obj_type = None):
         # Look up attribute and set self.type and self.member.
+        immutable_obj = obj_type is not None # used during type inference
         self.is_py_attr = 0
         self.member = self.attribute
         if obj_type is None:
@@ -4617,9 +4648,9 @@ class AttributeNode(ExprNode):
         # type, or it is an extension type and the attribute is either not
         # declared or is declared as a Python method. Treat it as a Python
         # attribute reference.
-        self.analyse_as_python_attribute(env, obj_type)
+        self.analyse_as_python_attribute(env, obj_type, immutable_obj)
 
-    def analyse_as_python_attribute(self, env, obj_type = None):
+    def analyse_as_python_attribute(self, env, obj_type=None, immutable_obj=False):
         if obj_type is None:
             obj_type = self.obj.type
         # mangle private '__*' Python attributes used inside of a class
@@ -4629,7 +4660,14 @@ class AttributeNode(ExprNode):
         self.is_py_attr = 1
         if not obj_type.is_pyobject and not obj_type.is_error:
             if obj_type.can_coerce_to_pyobject(env):
-                self.obj = self.obj.coerce_to_pyobject(env)
+                if not immutable_obj:
+                    self.obj = self.obj.coerce_to_pyobject(env)
+            elif (obj_type.is_cfunction and self.obj.is_name
+                  and self.obj.entry.as_variable
+                  and self.obj.entry.as_variable.type.is_pyobject):
+                # might be an optimised builtin function => unpack it
+                if not immutable_obj:
+                    self.obj = self.obj.coerce_to_pyobject(env)
             else:
                 error(self.pos,
                       "Object of type '%s' has no attribute '%s'" %
@@ -4948,68 +4986,78 @@ class SequenceNode(ExprNode):
     def generate_sequence_packing_code(self, code, target=None, plain=False):
         if target is None:
             target = self.result()
-        py_multiply = self.mult_factor and not self.mult_factor.type.is_int
-        if plain or py_multiply:
-            mult_factor = None
-        else:
+        size_factor = c_mult = ''
+        mult_factor = None
+
+        if self.mult_factor and not plain:
             mult_factor = self.mult_factor
-        if mult_factor:
-            mult = mult_factor.result()
-            if isinstance(mult_factor.constant_result, (int,long)) \
-                   and mult_factor.constant_result > 0:
-                size_factor = ' * %s' % mult_factor.constant_result
-            else:
-                size_factor = ' * ((%s<0) ? 0:%s)' % (mult, mult)
-        else:
-            size_factor = ''
-            mult = ''
+            if mult_factor.type.is_int:
+                c_mult = mult_factor.result()
+                if isinstance(mult_factor.constant_result, (int,long)) \
+                       and mult_factor.constant_result > 0:
+                    size_factor = ' * %s' % mult_factor.constant_result
+                else:
+                    size_factor = ' * ((%s<0) ? 0:%s)' % (c_mult, c_mult)
 
-        if self.type is Builtin.list_type:
-            create_func, set_item_func = 'PyList_New', 'PyList_SET_ITEM'
-        elif self.type is Builtin.tuple_type:
-            create_func, set_item_func = 'PyTuple_New', 'PyTuple_SET_ITEM'
-        else:
-            raise InternalError("sequence packing for unexpected type %s" % self.type)
-        arg_count = len(self.args)
-        code.putln("%s = %s(%s%s); %s" % (
-            target, create_func, arg_count, size_factor,
-            code.error_goto_if_null(target, self.pos)))
-        code.put_gotref(target)
-
-        if mult:
-            # FIXME: can't use a temp variable here as the code may
-            # end up in the constant building function.  Temps
-            # currently don't work there.
-
-            #counter = code.funcstate.allocate_temp(mult_factor.type, manage_ref=False)
-            counter = Naming.quick_temp_cname
-            code.putln('{ Py_ssize_t %s;' % counter)
-            if arg_count == 1:
-                offset = counter
-            else:
-                offset = '%s * %s' % (counter, arg_count)
-            code.putln('for (%s=0; %s < %s; %s++) {' % (
-                counter, counter, mult, counter
-                ))
-        else:
-            offset = ''
-        for i in xrange(arg_count):
-            arg = self.args[i]
-            if mult or not arg.result_in_temp():
-                code.put_incref(arg.result(), arg.ctype())
-            code.putln("%s(%s, %s, %s);" % (
-                set_item_func,
+        if self.type is Builtin.tuple_type and self.is_literal and not c_mult:
+            # use PyTuple_Pack() to avoid generating huge amounts of one-time code
+            code.putln('%s = PyTuple_Pack(%d, %s); %s' % (
                 target,
-                (offset and i) and ('%s + %s' % (offset, i)) or (offset or i),
-                arg.py_result()))
-            code.put_giveref(arg.py_result())
-        if mult:
-            code.putln('}')
-            #code.funcstate.release_temp(counter)
-            code.putln('}')
-        elif py_multiply and not plain:
+                len(self.args),
+                ', '.join([ arg.py_result() for arg in self.args ]),
+                code.error_goto_if_null(target, self.pos)))
+            code.put_gotref(target)
+        else:
+            # build the tuple/list step by step, potentially multiplying it as we go
+            if self.type is Builtin.list_type:
+                create_func, set_item_func = 'PyList_New', 'PyList_SET_ITEM'
+            elif self.type is Builtin.tuple_type:
+                create_func, set_item_func = 'PyTuple_New', 'PyTuple_SET_ITEM'
+            else:
+                raise InternalError("sequence packing for unexpected type %s" % self.type)
+            arg_count = len(self.args)
+            code.putln("%s = %s(%s%s); %s" % (
+                target, create_func, arg_count, size_factor,
+                code.error_goto_if_null(target, self.pos)))
+            code.put_gotref(target)
+
+            if c_mult:
+                # FIXME: can't use a temp variable here as the code may
+                # end up in the constant building function.  Temps
+                # currently don't work there.
+
+                #counter = code.funcstate.allocate_temp(mult_factor.type, manage_ref=False)
+                counter = Naming.quick_temp_cname
+                code.putln('{ Py_ssize_t %s;' % counter)
+                if arg_count == 1:
+                    offset = counter
+                else:
+                    offset = '%s * %s' % (counter, arg_count)
+                code.putln('for (%s=0; %s < %s; %s++) {' % (
+                    counter, counter, c_mult, counter
+                    ))
+            else:
+                offset = ''
+
+            for i in xrange(arg_count):
+                arg = self.args[i]
+                if c_mult or not arg.result_in_temp():
+                    code.put_incref(arg.result(), arg.ctype())
+                code.putln("%s(%s, %s, %s);" % (
+                    set_item_func,
+                    target,
+                    (offset and i) and ('%s + %s' % (offset, i)) or (offset or i),
+                    arg.py_result()))
+                code.put_giveref(arg.py_result())
+
+            if c_mult:
+                code.putln('}')
+                #code.funcstate.release_temp(counter)
+                code.putln('}')
+
+        if mult_factor is not None and mult_factor.type.is_pyobject:
             code.putln('{ PyObject* %s = PyNumber_InPlaceMultiply(%s, %s); %s' % (
-                Naming.quick_temp_cname, target, self.mult_factor.py_result(),
+                Naming.quick_temp_cname, target, mult_factor.py_result(),
                 code.error_goto_if_null(Naming.quick_temp_cname, self.pos)
                 ))
             code.put_gotref(Naming.quick_temp_cname)
@@ -5128,6 +5176,7 @@ class SequenceNode(ExprNode):
                 code.putln("%s = PySequence_ITEM(sequence, %d); %s" % (
                     item.result(), i,
                     code.error_goto_if_null(item.result(), self.pos)))
+                code.put_gotref(item.result())
         else:
             code.putln("Py_ssize_t i;")
             code.putln("PyObject** temps[%s] = {%s};" % (
@@ -5136,6 +5185,7 @@ class SequenceNode(ExprNode):
             code.putln("for (i=0; i < %s; i++) {" % len(self.unpacked_items))
             code.putln("PyObject* item = PySequence_ITEM(sequence, i); %s" % (
                 code.error_goto_if_null('item', self.pos)))
+            code.put_gotref('item')
             code.putln("*(temps[i]) = item;")
             code.putln("}")
 
@@ -7268,8 +7318,8 @@ def unop_node(pos, operator, operand):
     # given operator.
     if isinstance(operand, IntNode) and operator == '-':
         return IntNode(pos = operand.pos, value = str(-Utils.str_to_number(operand.value)))
-    elif isinstance(operand, UnopNode) and operand.operator == operator:
-        warning(pos, "Python has no increment/decrement operator: %s%sx = %s(%sx) = x" % ((operator,)*4), 5)
+    elif isinstance(operand, UnopNode) and operand.operator == operator in '+-':
+        warning(pos, "Python has no increment/decrement operator: %s%sx == %s(%sx) == x" % ((operator,)*4), 5)
     return unop_node_classes[operator](pos,
         operator = operator,
         operand = operand)
@@ -7301,6 +7351,9 @@ class TypecastNode(ExprNode):
         if self.type is None:
             base_type = self.base_type.analyse(env)
             _, self.type = self.declarator.analyse(base_type, env)
+        if self.operand.has_constant_result():
+            # Must be done after self.type is resolved.
+            self.calculate_constant_result()
         if self.type.is_cfunction:
             error(self.pos,
                 "Cannot cast to a function type")
@@ -7350,7 +7403,7 @@ class TypecastNode(ExprNode):
         return self.operand.is_simple()
 
     def nonlocally_immutable(self):
-        return self.operand.nonlocally_immutable()
+        return self.is_temp or self.operand.nonlocally_immutable()
 
     def nogil_check(self, env):
         if self.type and self.type.is_pyobject and self.is_temp:
@@ -7360,11 +7413,11 @@ class TypecastNode(ExprNode):
         return self.operand.check_const()
 
     def calculate_constant_result(self):
-        # we usually do not know the result of a type cast at code
-        # generation time
-        pass
+        self.constant_result = self.calculate_result_code(self.operand.constant_result)
 
-    def calculate_result_code(self):
+    def calculate_result_code(self, operand_result = None):
+        if operand_result is None:
+            operand_result = self.operand.result()
         if self.type.is_complex:
             operand_result = self.operand.result()
             if self.operand.type.is_complex:
@@ -7378,7 +7431,7 @@ class TypecastNode(ExprNode):
                     real_part,
                     imag_part)
         else:
-            return self.type.cast_code(self.operand.result())
+            return self.type.cast_code(operand_result)
 
     def get_constant_c_result_code(self):
         operand_result = self.operand.get_constant_c_result_code()
@@ -7957,6 +8010,7 @@ class NumBinopNode(BinopNode):
     #  Binary operation taking numeric arguments.
 
     infix = True
+    overflow_check = False
 
     def analyse_c_operation(self, env):
         type1 = self.operand1.type
@@ -7967,6 +8021,19 @@ class NumBinopNode(BinopNode):
             return
         if self.type.is_complex:
             self.infix = False
+        if (self.type.is_int
+                and env.directives['overflowcheck']
+                and self.operator in self.overflow_op_names):
+            if (self.operator in ('+', '*')
+                    and self.operand1.has_constant_result()
+                    and not self.operand2.has_constant_result()):
+                self.operand1, self.operand2 = self.operand2, self.operand1
+            self.overflow_check = True
+            self.func = self.type.overflow_check_binop(
+                self.overflow_op_names[self.operator],
+                env,
+                const_rhs = self.operand2.has_constant_result())
+            self.is_temp = True
         if not self.infix or (type1.is_numeric and type2.is_numeric):
             self.operand1 = self.operand1.coerce_to(self.type, env)
             self.operand2 = self.operand2.coerce_to(self.type, env)
@@ -8008,8 +8075,26 @@ class NumBinopNode(BinopNode):
         return (type1.is_numeric  or type1.is_enum) \
             and (type2.is_numeric  or type2.is_enum)
 
+    def generate_result_code(self, code):
+        super(NumBinopNode, self).generate_result_code(code)
+        if self.overflow_check:
+            self.overflow_bit = code.funcstate.allocate_temp(PyrexTypes.c_int_type, manage_ref=False)
+            code.putln("%s = 0;" % self.overflow_bit);
+            code.putln("%s = %s;" % (self.result(), self.calculate_result_code()))
+            code.putln("if (unlikely(%s)) {" % self.overflow_bit)
+            code.putln('PyErr_Format(PyExc_OverflowError, "value too large");')
+            code.putln(code.error_goto(self.pos))
+            code.putln("}")
+            code.funcstate.release_temp(self.overflow_bit)
+
     def calculate_result_code(self):
-        if self.infix:
+        if self.overflow_check:
+            return "%s(%s, %s, &%s)" % (
+                self.func,
+                self.operand1.result(),
+                self.operand2.result(),
+                self.overflow_bit)
+        elif self.infix:
             return "(%s %s %s)" % (
                 self.operand1.result(),
                 self.operator,
@@ -8047,6 +8132,13 @@ class NumBinopNode(BinopNode):
         "//":       "PyNumber_FloorDivide",
         "%":        "PyNumber_Remainder",
         "**":       "PyNumber_Power"
+    }
+    
+    overflow_op_names = {
+       "+":  "add",
+       "-":  "sub",
+       "*":  "mul",
+       "<<":  "lshift",
     }
 
 class IntBinopNode(NumBinopNode):
@@ -8511,6 +8603,9 @@ richcmp_constants = {
     "<>": "Py_NE",
     ">" : "Py_GT",
     ">=": "Py_GE",
+    # the following are faked by special compare functions
+    "in"    : "Py_EQ",
+    "not_in": "Py_NE",
 }
 
 class CmpNode(object):
@@ -8518,6 +8613,7 @@ class CmpNode(object):
     #  and CascadedCmpNodes.
 
     special_bool_cmp_function = None
+    special_bool_cmp_utility_code = None
 
     def infer_type(self, env):
         # TODO: Actually implement this (after merging with -unstable).
@@ -8696,34 +8792,53 @@ class CmpNode(object):
             return (container_type.is_ptr or container_type.is_array) \
                 and not container_type.is_string
 
-    def find_special_bool_compare_function(self, env):
+    def find_special_bool_compare_function(self, env, operand1):
+        # note: currently operand1 must get coerced to a Python object if we succeed here!
         if self.operator in ('==', '!='):
-            type1, type2 = self.operand1.type, self.operand2.type
-            if type1.is_pyobject and type2.is_pyobject:
+            type1, type2 = operand1.type, self.operand2.type
+            if type1.is_builtin_type and type2.is_builtin_type:
                 if type1 is Builtin.unicode_type or type2 is Builtin.unicode_type:
-                    env.use_utility_code(UtilityCode.load_cached("UnicodeEquals", "StringTools.c"))
+                    self.special_bool_cmp_utility_code = UtilityCode.load_cached("UnicodeEquals", "StringTools.c")
                     self.special_bool_cmp_function = "__Pyx_PyUnicode_Equals"
                     return True
                 elif type1 is Builtin.bytes_type or type2 is Builtin.bytes_type:
-                    env.use_utility_code(UtilityCode.load_cached("BytesEquals", "StringTools.c"))
+                    self.special_bool_cmp_utility_code = UtilityCode.load_cached("BytesEquals", "StringTools.c")
                     self.special_bool_cmp_function = "__Pyx_PyBytes_Equals"
                     return True
                 elif type1 is Builtin.str_type or type2 is Builtin.str_type:
-                    env.use_utility_code(UtilityCode.load_cached("StrEquals", "StringTools.c"))
+                    self.special_bool_cmp_utility_code = UtilityCode.load_cached("StrEquals", "StringTools.c")
                     self.special_bool_cmp_function = "__Pyx_PyString_Equals"
                     return True
+        elif self.operator in ('in', 'not_in'):
+            if self.operand2.type is Builtin.dict_type:
+                self.operand2 = self.operand2.as_none_safe_node("'NoneType' object is not iterable")
+                self.special_bool_cmp_utility_code = UtilityCode.load_cached("PyDictContains", "ObjectHandling.c")
+                self.special_bool_cmp_function = "__Pyx_PyDict_Contains"
+                return True
+            else:
+                if not self.operand2.type.is_pyobject:
+                    self.operand2 = self.operand2.coerce_to_pyobject(env)
+                self.special_bool_cmp_utility_code = UtilityCode.load_cached("PySequenceContains", "ObjectHandling.c")
+                self.special_bool_cmp_function = "__Pyx_PySequence_Contains"
+                return True
         return False
 
     def generate_operation_code(self, code, result_code,
             operand1, op , operand2):
         if self.type.is_pyobject:
-            coerce_result = "__Pyx_PyBool_FromLong"
+            error_clause = code.error_goto_if_null
+            got_ref = "__Pyx_XGOTREF(%s); " % result_code
+            if self.special_bool_cmp_function:
+                code.globalstate.use_utility_code(
+                    UtilityCode.load_cached("PyBoolOrNullFromLong", "ObjectHandling.c"))
+                coerce_result = "__Pyx_PyBoolOrNull_FromLong"
+            else:
+                coerce_result = "__Pyx_PyBool_FromLong"
         else:
+            error_clause = code.error_goto_if_neg
+            got_ref = ""
             coerce_result = ""
-        if 'not' in op:
-            negation = "!"
-        else:
-            negation = ""
+
         if self.special_bool_cmp_function:
             if operand1.type.is_pyobject:
                 result1 = operand1.py_result()
@@ -8733,60 +8848,36 @@ class CmpNode(object):
                 result2 = operand2.py_result()
             else:
                 result2 = operand2.result()
-            code.putln("%s = %s(%s, %s, %s); %s" % (
-                result_code,
-                self.special_bool_cmp_function,
-                result1,
-                result2,
-                richcmp_constants[op],
-                code.error_goto_if_neg(result_code, self.pos)))
-        elif op == 'in' or op == 'not_in':
-            code.globalstate.use_utility_code(contains_utility_code)
-            if self.type.is_pyobject:
-                coerce_result = "__Pyx_PyBoolOrNull_FromLong"
-            if op == 'not_in':
-                negation = "__Pyx_NegateNonNeg"
-            if operand2.type is dict_type:
-                method = "PyDict_Contains"
-            else:
-                method = "PySequence_Contains"
-            if self.type.is_pyobject:
-                error_clause = code.error_goto_if_null
-                got_ref = "__Pyx_XGOTREF(%s); " % result_code
-            else:
-                error_clause = code.error_goto_if_neg
-                got_ref = ""
+            if self.special_bool_cmp_utility_code:
+                code.globalstate.use_utility_code(self.special_bool_cmp_utility_code)
             code.putln(
-                "%s = %s(%s(%s(%s, %s))); %s%s" % (
+                "%s = %s(%s(%s, %s, %s)); %s%s" % (
                     result_code,
                     coerce_result,
-                    negation,
-                    method,
-                    operand2.py_result(),
-                    operand1.py_result(),
+                    self.special_bool_cmp_function,
+                    result1, result2, richcmp_constants[op],
                     got_ref,
                     error_clause(result_code, self.pos)))
-        elif (operand1.type.is_pyobject
-            and op not in ('is', 'is_not')):
-                code.putln("%s = PyObject_RichCompare(%s, %s, %s); %s" % (
-                        result_code,
-                        operand1.py_result(),
-                        operand2.py_result(),
-                        richcmp_constants[op],
-                        code.error_goto_if_null(result_code, self.pos)))
-                code.put_gotref(result_code)
+
+        elif operand1.type.is_pyobject and op not in ('is', 'is_not'):
+            assert op not in ('in', 'not_in'), op
+            code.putln("%s = PyObject_RichCompare(%s, %s, %s); %s%s" % (
+                    result_code,
+                    operand1.py_result(),
+                    operand2.py_result(),
+                    richcmp_constants[op],
+                    got_ref,
+                    error_clause(result_code, self.pos)))
+
         elif operand1.type.is_complex:
-            if op == "!=":
-                negation = "!"
-            else:
-                negation = ""
             code.putln("%s = %s(%s%s(%s, %s));" % (
                 result_code,
                 coerce_result,
-                negation,
+                op == "!=" and "!" or "",
                 operand1.type.unary_op('eq'),
                 operand1.result(),
                 operand2.result()))
+
         else:
             type1 = operand1.type
             type2 = operand2.type
@@ -8813,17 +8904,6 @@ class CmpNode(object):
             return "!="
         else:
             return op
-
-contains_utility_code = UtilityCode(
-proto="""
-static CYTHON_INLINE int __Pyx_NegateNonNeg(int b) {
-    return unlikely(b < 0) ? b : !b;
-}
-static CYTHON_INLINE PyObject* __Pyx_PyBoolOrNull_FromLong(long b) {
-    return unlikely(b < 0) ? NULL : __Pyx_PyBool_FromLong(b);
-}
-""")
-
 
 class PrimaryCmpNode(ExprNode, CmpNode):
     #  Non-cascaded comparison or first comparison of
@@ -8892,19 +8972,23 @@ class PrimaryCmpNode(ExprNode, CmpNode):
                     "argument of type 'NoneType' is not iterable")
             elif self.is_ptr_contains():
                 if self.cascade:
-                    error(self.pos, "Cascading comparison not yet supported for 'val in sliced pointer'.")
+                    error(self.pos, "Cascading comparison not supported for 'val in sliced pointer'.")
                 self.type = PyrexTypes.c_bint_type
                 # Will be transformed by IterationTransform
                 return
+            elif self.find_special_bool_compare_function(env, self.operand1):
+                if not self.operand1.type.is_pyobject:
+                    self.operand1 = self.operand1.coerce_to_pyobject(env)
+                common_type = None # if coercion needed, the method call above has already done it
+                self.is_pycmp = False # result is bint
             else:
-                if self.operand2.type is dict_type:
-                    self.operand2 = self.operand2.as_none_safe_node("'NoneType' object is not iterable")
                 common_type = py_object_type
                 self.is_pycmp = True
-        elif self.find_special_bool_compare_function(env):
+        elif self.find_special_bool_compare_function(env, self.operand1):
+            if not self.operand1.type.is_pyobject:
+                self.operand1 = self.operand1.coerce_to_pyobject(env)
             common_type = None # if coercion needed, the method call above has already done it
             self.is_pycmp = False # result is bint
-            self.is_temp = True # must check for error return
         else:
             common_type = self.find_common_type(env, self.operator, self.operand1)
             self.is_pycmp = common_type.is_pyobject
@@ -8915,7 +8999,8 @@ class PrimaryCmpNode(ExprNode, CmpNode):
             self.coerce_operands_to(common_type, env)
 
         if self.cascade:
-            self.operand2 = self.operand2.coerce_to_simple(env)
+            self.operand2 = self.cascade.optimise_comparison(
+                self.operand2.coerce_to_simple(env), env)
             self.cascade.coerce_cascaded_operands_to_temp(env)
         if self.is_python_result():
             self.type = PyrexTypes.py_object_type
@@ -8925,7 +9010,8 @@ class PrimaryCmpNode(ExprNode, CmpNode):
         while cdr:
             cdr.type = self.type
             cdr = cdr.cascade
-        if self.is_pycmp or self.cascade:
+        if self.is_pycmp or self.cascade or self.special_bool_cmp_function:
+            # 1) owned reference, 2) reused value, 3) potential function error return value
             self.is_temp = 1
 
     def analyse_cpp_comparison(self, env):
@@ -9078,6 +9164,14 @@ class CascadedCmpNode(Node, CmpNode):
 
     def has_python_operands(self):
         return self.operand2.type.is_pyobject
+
+    def optimise_comparison(self, operand1, env):
+        if self.find_special_bool_compare_function(env, operand1):
+            if not operand1.type.is_pyobject:
+                operand1 = operand1.coerce_to_pyobject(env)
+        if self.cascade:
+            self.operand2 = self.cascade.optimise_comparison(self.operand2, env)
+        return operand1
 
     def coerce_operands_to_pyobjects(self, env):
         self.operand2 = self.operand2.coerce_to_pyobject(env)
@@ -9253,6 +9347,9 @@ class PyTypeTestNode(CoercionNode):
     def is_ephemeral(self):
         return self.arg.is_ephemeral()
 
+    def nonlocally_immutable(self):
+        return self.arg.nonlocally_immutable()
+
     def calculate_constant_result(self):
         # FIXME
         pass
@@ -9308,6 +9405,9 @@ class NoneCheckNode(CoercionNode):
 
     def result_in_temp(self):
         return self.arg.result_in_temp()
+
+    def nonlocally_immutable(self):
+        return self.arg.nonlocally_immutable()
 
     def calculate_result_code(self):
         return self.arg.result()
@@ -9808,86 +9908,6 @@ static PyObject *__Pyx_GetName(PyObject *dict, PyObject *name) {
     return result;
 }
 """ % {'BUILTINS' : Naming.builtins_cname})
-
-#------------------------------------------------------------------------------------
-
-import_utility_code = UtilityCode(
-proto = """
-static PyObject *__Pyx_Import(PyObject *name, PyObject *from_list, long level); /*proto*/
-""",
-impl = """
-static PyObject *__Pyx_Import(PyObject *name, PyObject *from_list, long level) {
-    PyObject *py_import = 0;
-    PyObject *empty_list = 0;
-    PyObject *module = 0;
-    PyObject *global_dict = 0;
-    PyObject *empty_dict = 0;
-    PyObject *list;
-    py_import = __Pyx_GetAttrString(%(BUILTINS)s, "__import__");
-    if (!py_import)
-        goto bad;
-    if (from_list)
-        list = from_list;
-    else {
-        empty_list = PyList_New(0);
-        if (!empty_list)
-            goto bad;
-        list = empty_list;
-    }
-    global_dict = PyModule_GetDict(%(GLOBALS)s);
-    if (!global_dict)
-        goto bad;
-    empty_dict = PyDict_New();
-    if (!empty_dict)
-        goto bad;
-    #if PY_VERSION_HEX >= 0x02050000
-    {
-        #if PY_MAJOR_VERSION >= 3
-        if (level == -1) {
-            if (strchr(__Pyx_MODULE_NAME, '.')) {
-                /* try package relative import first */
-                PyObject *py_level = PyInt_FromLong(1);
-                if (!py_level)
-                    goto bad;
-                module = PyObject_CallFunctionObjArgs(py_import,
-                    name, global_dict, empty_dict, list, py_level, NULL);
-                Py_DECREF(py_level);
-                if (!module) {
-                    if (!PyErr_ExceptionMatches(PyExc_ImportError))
-                        goto bad;
-                    PyErr_Clear();
-                }
-            }
-            level = 0; /* try absolute import on failure */
-        }
-        #endif
-        if (!module) {
-            PyObject *py_level = PyInt_FromLong(level);
-            if (!py_level)
-                goto bad;
-            module = PyObject_CallFunctionObjArgs(py_import,
-                name, global_dict, empty_dict, list, py_level, NULL);
-            Py_DECREF(py_level);
-        }
-    }
-    #else
-    if (level>0) {
-        PyErr_SetString(PyExc_RuntimeError, "Relative import is not supported for Python <=2.4.");
-        goto bad;
-    }
-    module = PyObject_CallFunctionObjArgs(py_import,
-        name, global_dict, empty_dict, list, NULL);
-    #endif
-bad:
-    Py_XDECREF(empty_list);
-    Py_XDECREF(py_import);
-    Py_XDECREF(empty_dict);
-    return module;
-}
-""" % {
-    "BUILTINS": Naming.builtins_cname,
-    "GLOBALS":  Naming.module_cname,
-})
 
 #------------------------------------------------------------------------------------
 

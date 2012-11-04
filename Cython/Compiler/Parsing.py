@@ -278,17 +278,17 @@ def _p_factor(s):
         pos = s.position()
         s.next()
         return ExprNodes.unop_node(pos, op, p_factor(s))
-    elif sy == '&':
-        pos = s.position()
-        s.next()
-        arg = p_factor(s)
-        return ExprNodes.AmpersandNode(pos, operand = arg)
-    elif sy == "<":
-        return p_typecast(s)
-    elif sy == 'IDENT' and s.systring == "sizeof":
-        return p_sizeof(s)
-    else:
-        return p_power(s)
+    elif not s.in_python_file:
+        if sy == '&':
+            pos = s.position()
+            s.next()
+            arg = p_factor(s)
+            return ExprNodes.AmpersandNode(pos, operand = arg)
+        elif sy == "<":
+            return p_typecast(s)
+        elif sy == 'IDENT' and s.systring == "sizeof":
+            return p_sizeof(s)
+    return p_power(s)
 
 def p_typecast(s):
     # s.sy == "<"
@@ -1982,6 +1982,11 @@ def p_c_simple_base_type(s, self_flag, nonempty, templates = None):
     pos = s.position()
     if not s.sy == 'IDENT':
         error(pos, "Expected an identifier, found '%s'" % s.sy)
+    if s.systring == 'const':
+        s.next()
+        base_type = p_c_base_type(s,
+            self_flag = self_flag, nonempty = nonempty, templates = templates)
+        return Nodes.CConstTypeNode(pos, base_type = base_type)
     if looking_at_base_type(s):
         #print "p_c_simple_base_type: looking_at_base_type at", s.position()
         is_basic = 1
@@ -2462,7 +2467,7 @@ def p_c_arg_decl(s, ctx, in_pyfunc, cmethod_flag = 0, nonempty = 0,
         annotation = p_test(s)
     if s.sy == '=':
         s.next()
-        if 'pxd' in s.level:
+        if 'pxd' in ctx.level:
             if s.sy not in ['*', '?']:
                 error(pos, "default values cannot be specified in pxd files, use ? or *")
             default = ExprNodes.BoolNode(1)
@@ -2513,8 +2518,6 @@ def p_cdef_statement(s, ctx):
             error(pos, "Extension types cannot be declared cpdef")
         return p_c_class_definition(s, pos, ctx)
     elif s.sy == 'IDENT' and s.systring == 'cppclass':
-        if ctx.visibility != 'extern':
-            error(pos, "C++ classes need to be declared extern")
         return p_cpp_class_definition(s, pos, ctx)
     elif s.sy == 'IDENT' and s.systring in struct_enum_union:
         if ctx.level not in ('module', 'module_pxd'):
@@ -2705,8 +2708,13 @@ def p_c_func_or_var_declaration(s, pos, ctx):
     declarator = p_c_declarator(s, ctx, cmethod_flag = cmethod_flag,
                                 assignable = 1, nonempty = 1)
     declarator.overridable = ctx.overridable
+    if s.sy == 'IDENT' and s.systring == 'const' and ctx.level == 'cpp_class':
+        s.next()
+        is_const_method = 1
+    else:
+        is_const_method = 0
     if s.sy == ':':
-        if ctx.level not in ('module', 'c_class', 'module_pxd', 'c_class_pxd') and not ctx.templates:
+        if ctx.level not in ('module', 'c_class', 'module_pxd', 'c_class_pxd', 'cpp_class') and not ctx.templates:
             s.error("C function definition not allowed here")
         doc, suite = p_suite(s, Ctx(level = 'function'), with_doc = 1)
         result = Nodes.CFuncDefNode(pos,
@@ -2717,7 +2725,8 @@ def p_c_func_or_var_declaration(s, pos, ctx):
             doc = doc,
             modifiers = modifiers,
             api = ctx.api,
-            overridable = ctx.overridable)
+            overridable = ctx.overridable,
+            is_const_method = is_const_method)
     else:
         #if api:
         #    s.error("'api' not allowed with variable declaration")
@@ -3041,10 +3050,10 @@ def p_cpp_class_definition(s, pos,  ctx):
         templates = None
     if s.sy == '(':
         s.next()
-        base_classes = [p_dotted_name(s, False)[2]]
+        base_classes = [p_c_base_type(s, templates = templates)]
         while s.sy == ',':
             s.next()
-            base_classes.append(p_dotted_name(s, False)[2])
+            base_classes.append(p_c_base_type(s, templates = templates))
         s.expect(')')
     else:
         base_classes = []
@@ -3055,7 +3064,7 @@ def p_cpp_class_definition(s, pos,  ctx):
         s.expect('NEWLINE')
         s.expect_indent()
         attributes = []
-        body_ctx = Ctx(visibility = ctx.visibility)
+        body_ctx = Ctx(visibility = ctx.visibility, level='cpp_class')
         body_ctx.templates = templates
         while s.sy != 'DEDENT':
             if s.systring == 'cppclass':
